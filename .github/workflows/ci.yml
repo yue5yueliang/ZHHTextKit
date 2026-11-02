@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app || sudo xcode-select -s /Applications/Xcode.app
+
+      - name: CocoaPods
+        working-directory: Example
+        run: |
+          gem install cocoapods --no-document
+          pod install
+
+      - name: Test
+        working-directory: Example
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -workspace ZHHTextKit.xcworkspace \
+            -scheme ZHHTextKit-Example \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -enableCodeCoverage YES \
+            | xcpretty
+
+      - name: Pod Lint
+        run: pod lib lint --allow-warnings --skip-tests

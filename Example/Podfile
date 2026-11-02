@@ -1,0 +1,14 @@
+use_frameworks!
+
+platform :ios, '15.0'
+
+target 'ZHHTextKit_Example' do
+  pod 'ZHHTextKit', :path => '../'
+  pod 'LookinServer', :subspecs => ['Swift'], :configurations => ['Debug']
+
+  target 'ZHHTextKit_Tests' do
+    inherit! :search_paths
+
+    
+  end
+end
