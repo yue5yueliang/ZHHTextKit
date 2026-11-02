@@ -247,12 +247,22 @@ final class ZHHTextLineLayout {
     /// 命中链接或截断 token。
     ///
     /// 「全文 / 收起」热区会外扩一圈；带边框的链接按边框视觉区域命中（含 outsets），与按下高亮一致。
+    /// 正文点击热区外扩（与「全文」热区同量级），仅在 `allowsBodyTap` 时启用。
+    private static let bodyTapPaddingX: CGFloat = 10
+    private static let bodyTapPaddingY: CGFloat = 10
+
     /// - Parameters:
     ///   - point: UIKit 坐标。
     ///   - displayText: 展示串。
     ///   - linksByID: 链接 id 表。
+    ///   - allowsBodyTap: 为 true 时，点在非链接字形（含外扩热区）上返回正文命中。
     /// - Returns: 命中动作；未命中为 nil。
-    func hit(at point: CGPoint, displayText: NSAttributedString, linksByID: [String: ZHHTextLink]) -> ZHHTextHitAction? {
+    func hit(
+        at point: CGPoint,
+        displayText: NSAttributedString,
+        linksByID: [String: ZHHTextLink],
+        allowsBodyTap: Bool = false
+    ) -> ZHHTextHitAction? {
         // 1) 截断 token 优先：热区外扩，避免被后面的字形命中抢走。
         if let expand = hitExpandToken(at: point, displayText: displayText) {
             return expand
@@ -262,33 +272,218 @@ final class ZHHTextLineLayout {
             return bordered
         }
 
-        // 3) 普通路径：先落到最近行，再把 x 换成该行内的字符下标。
-        // y 上下各放宽 1pt，减轻贴边点击的漏检。
-        guard point.y >= -1, point.y <= size.height + 1, let line = nearestLine(to: point) else {
-            return nil
+        // 3) 先按字形精确命中。
+        // 必须在链接外扩之前：否则「《用户协议》和《隐私政策》」里的「和」会被两侧链接热区抢走。
+        let verticalBound = allowsBodyTap ? Self.bodyTapPaddingY : 1
+        let lineSlop = allowsBodyTap ? Self.bodyTapPaddingY : 0
+        if point.y >= -verticalBound,
+           point.y <= size.height + verticalBound,
+           let line = nearestLine(to: point, extraSlop: lineSlop),
+           let action = hitCharacter(
+            on: line,
+            point: point,
+            displayText: displayText,
+            linksByID: linksByID,
+            allowsBodyTap: allowsBodyTap
+           ) {
+            return action
         }
+
+        // 4) 空白处再给链接外扩热区（不会覆盖已落在正文字形上的点）。
+        if allowsBodyTap, let paddedLink = hitLinkPadded(at: point, displayText: displayText, linksByID: linksByID) {
+            return paddedLink
+        }
+
+        // 5) 正文热区兜底：落在行框外扩区域内也算点中正文。
+        if allowsBodyTap {
+            return hitBodyPadded(at: point, displayText: displayText, linksByID: linksByID)
+        }
+        return nil
+    }
+
+    /// 在指定行上按字符命中链接或正文。
+    private func hitCharacter(
+        on line: ZHHTextLaidLine,
+        point: CGPoint,
+        displayText: NSAttributedString,
+        linksByID: [String: ZHHTextLink],
+        allowsBodyTap: Bool
+    ) -> ZHHTextHitAction? {
+        guard line.range.length > 0 else { return nil }
         // CTLine 的 position.x 相对行起点；要先减去 layout 里记下的 originX。
         let relativeX = point.x - line.originX
+
+        // 正文可点时：先扫紧贴的正文字形。两链接夹着的「和」即使 CT 更靠近邻接链接，也归正文。
+        if allowsBodyTap,
+           let bodyIndex = tightBodyGlyphIndex(on: line, relativeX: relativeX, displayText: displayText) {
+            return ZHHTextHitAction(
+                kind: .body,
+                displayRange: bodyHighlightRange(at: bodyIndex, in: displayText)
+            )
+        }
+
         let rawIndex = CTLineGetStringIndexForPosition(line.ctLine, CGPoint(x: relativeX, y: 0))
         let lineEnd = line.range.location + line.range.length
         // 点在行首左侧时 rawIndex 可能仍落在行首，后面用 containsGlyph 再滤一次。
-        guard line.range.length > 0, rawIndex >= line.range.location else { return nil }
+        guard rawIndex >= line.range.location else { return nil }
         // 点在行尾空白时 index 可能顶到 lineEnd，夹到最后一个字符再查属性。
         let index = min(rawIndex, lineEnd - 1)
         guard index >= 0, index < displayText.length else { return nil }
-        // 排除行内空白 / 尾随空隙：只有真正点在字形上才算命中。
-        guard containsGlyph(line: line, index: index, relativeX: relativeX) else { return nil }
 
-        // 4) 读 linkID，并用 effectiveRange 扩成整段链接（与绑定删除、高亮区间一致）。
         var effective = NSRange()
-        if let identifier = displayText.attribute(
+        let linkID = displayText.attribute(
             ZHHTextAttribute.linkID,
             at: index,
             effectiveRange: &effective
-        ) as? String, let link = linksByID[identifier] {
+        ) as? String
+        let isLink = linkID != nil && linkID.flatMap { linksByID[$0] } != nil
+        // 链接用紧字形；正文可点时正文侧放宽。
+        let glyphSlop: CGFloat = (allowsBodyTap && !isLink) ? Self.bodyTapPaddingX : 2
+        guard containsGlyph(line: line, index: index, relativeX: relativeX, slop: glyphSlop) else { return nil }
+
+        if let identifier = linkID, let link = linksByID[identifier] {
             return ZHHTextHitAction(kind: .link(link), displayRange: effective)
         }
+        if allowsBodyTap {
+            return ZHHTextHitAction(kind: .body, displayRange: bodyHighlightRange(at: index, in: displayText))
+        }
         return nil
+    }
+
+    /// 行内是否有紧贴 `relativeX` 的普通正文字形；有则返回其下标。
+    private func tightBodyGlyphIndex(
+        on line: ZHHTextLaidLine,
+        relativeX: CGFloat,
+        displayText: NSAttributedString
+    ) -> Int? {
+        let ns = displayText.string as NSString
+        var index = line.range.location
+        let end = NSMaxRange(line.range)
+        while index < end {
+            let composed = ns.rangeOfComposedCharacterSequence(at: index)
+            defer { index = NSMaxRange(composed) }
+            guard composed.location < displayText.length else { continue }
+            if displayText.attribute(ZHHTextAttribute.linkID, at: composed.location, effectiveRange: nil) != nil {
+                continue
+            }
+            if displayText.attribute(ZHHTextAttribute.truncation, at: composed.location, effectiveRange: nil) != nil {
+                continue
+            }
+            if containsGlyph(line: line, index: composed.location, relativeX: relativeX, slop: 2) {
+                return composed.location
+            }
+        }
+        return nil
+    }
+
+    /// 无边框链接的外扩命中，仅配合 `allowsBodyTap` 使用。
+    ///
+    /// 若落点下的字形是普通正文（如两链接之间的「和」），不抢，留给正文点击。
+    private func hitLinkPadded(
+        at point: CGPoint,
+        displayText: NSAttributedString,
+        linksByID: [String: ZHHTextLink]
+    ) -> ZHHTextHitAction? {
+        guard displayText.length > 0 else { return nil }
+        if isTightBodyGlyph(at: point, displayText: displayText) {
+            return nil
+        }
+        let full = NSRange(location: 0, length: displayText.length)
+        var matched: ZHHTextHitAction?
+        displayText.enumerateAttribute(ZHHTextAttribute.linkID, in: full) { value, range, stop in
+            guard let identifier = value as? String,
+                  let link = linksByID[identifier],
+                  range.length > 0 else { return }
+            let padded = rects(for: range).map {
+                $0.insetBy(dx: -Self.bodyTapPaddingX, dy: -Self.bodyTapPaddingY)
+            }
+            guard padded.contains(where: { $0.contains(point) }) else { return }
+            matched = ZHHTextHitAction(kind: .link(link), displayRange: range)
+            stop.pointee = true
+        }
+        return matched
+    }
+
+    /// 点是否落在「非链接」正文字形上（紧容差），用于阻止链接热区吞掉夹心字。
+    private func isTightBodyGlyph(at point: CGPoint, displayText: NSAttributedString) -> Bool {
+        guard let line = nearestLine(to: point, extraSlop: Self.bodyTapPaddingY) else { return false }
+        let relativeX = point.x - line.originX
+        return tightBodyGlyphIndex(on: line, relativeX: relativeX, displayText: displayText) != nil
+    }
+
+    /// 正文外扩热区：点在行框周围也能勾选；空白处链接热区仍可点。
+    private func hitBodyPadded(
+        at point: CGPoint,
+        displayText: NSAttributedString,
+        linksByID: [String: ZHHTextLink]
+    ) -> ZHHTextHitAction? {
+        if let link = hitLinkPadded(at: point, displayText: displayText, linksByID: linksByID) {
+            return link
+        }
+        for line in lines where line.range.length > 0 {
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            let width = CGFloat(CTLineGetTypographicBounds(line.ctLine, &ascent, &descent, nil))
+            let hot = CGRect(
+                x: line.originX,
+                y: line.rect.minY,
+                width: max(width, 0),
+                height: line.rect.height
+            ).insetBy(dx: -Self.bodyTapPaddingX, dy: -Self.bodyTapPaddingY)
+            guard hot.contains(point) else { continue }
+
+            let relativeX = point.x - line.originX
+            let rawIndex = CTLineGetStringIndexForPosition(line.ctLine, CGPoint(x: relativeX, y: 0))
+            let lineEnd = line.range.location + line.range.length
+            let index = min(max(rawIndex, line.range.location), lineEnd - 1)
+            guard index >= 0, index < displayText.length else { continue }
+
+            if let identifier = displayText.attribute(
+                ZHHTextAttribute.linkID,
+                at: index,
+                effectiveRange: nil
+            ) as? String, let link = linksByID[identifier] {
+                var effective = NSRange()
+                _ = displayText.attribute(ZHHTextAttribute.linkID, at: index, effectiveRange: &effective)
+                return ZHHTextHitAction(kind: .link(link), displayRange: effective)
+            }
+            return ZHHTextHitAction(kind: .body, displayRange: bodyHighlightRange(at: index, in: displayText))
+        }
+        return nil
+    }
+
+    /// 按下高亮用的连续正文区间：从命中字向两边扩到链接 / 截断 token 边界。
+    private func bodyHighlightRange(at index: Int, in displayText: NSAttributedString) -> NSRange {
+        let ns = displayText.string as NSString
+        guard displayText.length > 0, index >= 0, index < displayText.length else {
+            return NSRange(location: 0, length: 0)
+        }
+
+        func isBodyIndex(_ i: Int) -> Bool {
+            guard i >= 0, i < displayText.length else { return false }
+            if displayText.attribute(ZHHTextAttribute.linkID, at: i, effectiveRange: nil) != nil {
+                return false
+            }
+            if displayText.attribute(ZHHTextAttribute.truncation, at: i, effectiveRange: nil) != nil {
+                return false
+            }
+            return true
+        }
+
+        var start = index
+        while start > 0, isBodyIndex(start - 1) {
+            start -= 1
+        }
+        var end = index
+        while end + 1 < displayText.length, isBodyIndex(end + 1) {
+            end += 1
+        }
+
+        let startRange = ns.rangeOfComposedCharacterSequence(at: start)
+        let endRange = ns.rangeOfComposedCharacterSequence(at: end)
+        let location = startRange.location
+        let max = endRange.location + endRange.length
+        return NSRange(location: location, length: max - location)
     }
 
     /// 按视觉框命中链接：有边框时含 outsets，与按下高亮区域一致。
@@ -417,13 +612,28 @@ final class ZHHTextLineLayout {
 
     // MARK: - 绘制
 
+    /// 按下反馈样式：链接 / 截断用背景，普通正文用字色。
+    enum PressHighlightStyle {
+        /// 圆角底色（链接、「全文 / 收起」）。
+        case background
+        /// 仅改前景色（普通正文）。
+        case foreground
+    }
+
     /// 按边框、背景、阴影、正文、内阴影、图片的顺序绘制。
     /// - Parameters:
     ///   - context: 当前图形上下文。
     ///   - text: 展示串。
     ///   - highlight: 按下高亮区间。
-    ///   - highlightColor: 无 `ZHHTextHighlight` 时的默认底色。
-    func draw(in context: CGContext, text: NSAttributedString, highlight: NSRange?, highlightColor: UIColor) {
+    ///   - highlightColor: 背景高亮时的底色，或前景高亮时的字色。
+    ///   - highlightStyle: 按下反馈样式；默认背景。
+    func draw(
+        in context: CGContext,
+        text: NSAttributedString,
+        highlight: NSRange?,
+        highlightColor: UIColor,
+        highlightStyle: PressHighlightStyle = .background
+    ) {
         // 按下区间若挂了自定义 ZHHTextHighlight，整段外观要换成高亮配置。
         let custom = highlight.flatMap { range -> ZHHTextHighlight? in
             guard range.length > 0, range.location < text.length else { return nil }
@@ -436,11 +646,21 @@ final class ZHHTextLineLayout {
 
         let paintText: NSAttributedString
         let painter: ZHHTextLineLayout
+        let width = constrainedWidth > 0 ? constrainedWidth : size.width
         if let range = highlight, let custom = custom {
             // 自定义高亮可能改字色/边框/阴影，度量会变，必须重排。
             paintText = text.zhh_applying(highlight: custom, range: range)
             // 必须用原约束宽重排；用 size.width（内容紧包围）会导致居中文本整体左移。
-            let width = constrainedWidth > 0 ? constrainedWidth : size.width
+            painter = ZHHTextLineLayout.make(attributedText: paintText, width: width)
+        } else if let range = highlight,
+                  range.length > 0,
+                  custom == nil,
+                  highlightStyle == .foreground,
+                  NSMaxRange(range) <= text.length {
+            // 正文按下：只改字色。CTLine 属性在创建时固化，必须重排才能看到新颜色。
+            let mutable = NSMutableAttributedString(attributedString: text)
+            mutable.addAttribute(.foregroundColor, value: highlightColor, range: range)
+            paintText = mutable
             painter = ZHHTextLineLayout.make(attributedText: paintText, width: width)
         } else {
             // 无自定义高亮：沿用当前行框，避免无谓重排。
@@ -452,8 +672,11 @@ final class ZHHTextLineLayout {
         painter.drawBorders(in: context, text: paintText)
         painter.drawBackgrounds(in: context, text: paintText)
 
-        // 默认按下底：没有 ZHHTextHighlight 时，用传入的 highlightColor 铺一层圆角。
-        if let highlight = highlight, highlight.length > 0, custom == nil {
+        // 链接 / 截断默认按下底：没有 ZHHTextHighlight 时，用传入的 highlightColor 铺一层圆角。
+        if let highlight = highlight,
+           highlight.length > 0,
+           custom == nil,
+           highlightStyle == .background {
             context.saveGState()
             context.setFillColor(highlightColor.cgColor)
             let radius = highlightCornerRadius(for: highlight, in: paintText)
@@ -734,13 +957,16 @@ private extension ZHHTextLineLayout {
     }
 
     /// 取与点纵向最近且距离合理的一行。
-    func nearestLine(to point: CGPoint) -> ZHHTextLaidLine? {
+    /// - Parameters:
+    ///   - point: UIKit 坐标。
+    ///   - extraSlop: 在默认半行高 + 2pt 之外再放宽的纵向容差。
+    func nearestLine(to point: CGPoint, extraSlop: CGFloat = 0) -> ZHHTextLaidLine? {
         var chosen: ZHHTextLaidLine?
         var bestDistance = CGFloat.greatestFiniteMagnitude
         for line in lines {
             // 用行中线距离；limit 约为半行高再加 2pt，点离太远就不认这一行。
             let distance = abs(line.rect.midY - point.y)
-            let limit = max(line.rect.height / 2 + 2, 2)
+            let limit = max(line.rect.height / 2 + 2 + extraSlop, 2)
             if distance <= limit && distance < bestDistance {
                 bestDistance = distance
                 chosen = line
@@ -750,13 +976,22 @@ private extension ZHHTextLineLayout {
     }
 
     /// 点的相对 x 是否落在该字形宽度内，避免点中行尾空白。
-    func containsGlyph(line: ZHHTextLaidLine, index: Int, relativeX: CGFloat) -> Bool {
+    /// - Parameters:
+    ///   - line: 目标行。
+    ///   - index: 展示串下标。
+    ///   - relativeX: 相对行起点的 x。
+    ///   - slop: 左右外扩容差；默认 2pt。
+    func containsGlyph(
+        line: ZHHTextLaidLine,
+        index: Int,
+        relativeX: CGFloat,
+        slop: CGFloat = 2
+    ) -> Bool {
         // index → index+1 的行内偏移即该字宽度；RTL 时可能 end < start。
         let start = CGFloat(CTLineGetOffsetForStringIndex(line.ctLine, index, nil))
         let end = CGFloat(CTLineGetOffsetForStringIndex(line.ctLine, index + 1, nil))
-        // 左右各放宽 2pt，减轻贴边漏点。
-        let left = min(start, end) - 2
-        let right = max(start, end) + 2
+        let left = min(start, end) - slop
+        let right = max(start, end) + slop
         return relativeX >= left && relativeX <= right
     }
 }

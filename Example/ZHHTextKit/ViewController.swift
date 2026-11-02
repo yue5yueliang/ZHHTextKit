@@ -11,18 +11,18 @@ import UIKit
 /// Demo 首页。列出社区 Feed、Text Editor 以及各类能力示例页。
 final class ViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
+    private let viewModel = DemoHomeViewModel()
     private let tableView = UITableView(frame: .zero, style: .insetGrouped)
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "ZHHTextKit Demo"
+        title = viewModel.title
         view.backgroundColor = .systemGroupedBackground
         navigationController?.navigationBar.prefersLargeTitles = false
 
         tableView.dataSource = self
         tableView.delegate = self
         tableView.backgroundColor = .systemGroupedBackground
-        // iOS 15+ 默认 section 顶垫 + grouped 默认 header 高度，两处一起清掉。
         tableView.sectionHeaderTopPadding = 0
         tableView.tableHeaderView = UIView(frame: CGRect(x: 0, y: 0, width: 0, height: CGFloat.leastNormalMagnitude))
         tableView.translatesAutoresizingMaskIntoConstraints = false
@@ -36,14 +36,14 @@ final class ViewController: UIViewController, UITableViewDataSource, UITableView
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        DemoCatalog.entries.count
+        viewModel.numberOfRows
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let identifier = "demo"
         let cell = tableView.dequeueReusableCell(withIdentifier: identifier)
             ?? UITableViewCell(style: .subtitle, reuseIdentifier: identifier)
-        let entry = DemoCatalog.entries[indexPath.row]
+        let entry = viewModel.entry(at: indexPath.row)
         cell.textLabel?.text = entry.title
         cell.detailTextLabel?.text = entry.detail
         cell.detailTextLabel?.textColor = .secondaryLabel
@@ -69,7 +69,7 @@ final class ViewController: UIViewController, UITableViewDataSource, UITableView
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        let entry = DemoCatalog.entries[indexPath.row]
+        let entry = viewModel.entry(at: indexPath.row)
         let controller = entry.make()
         controller.title = entry.title
         navigationController?.pushViewController(controller, animated: true)

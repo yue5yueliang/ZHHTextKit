@@ -49,8 +49,10 @@ public struct ZHHTextStyle {
     public var truncationColor: UIColor
     /// 「全文 / 收起」字体。为空时使用 `font`。
     public var truncationFont: UIFont?
-    /// 按下链接时的底色。
+    /// 按下链接 /「全文」时的底色。
     public var highlightColor: UIColor
+    /// 按下普通正文时的字色。为空时使用略透明的 `textColor`。
+    public var bodyHighlightColor: UIColor?
     /// 行间距，单位 point。
     public var lineSpacing: CGFloat
     /// 水平对齐。
@@ -74,7 +76,8 @@ public struct ZHHTextStyle {
     ///   - phoneColor: 电话色；为空时用 `linkColor`。
     ///   - truncationColor: 「全文 / 收起」颜色。
     ///   - truncationFont: 「全文 / 收起」字体；为空时用 `font`。
-    ///   - highlightColor: 按下链接时的底色。
+    ///   - highlightColor: 按下链接 /「全文」时的底色。
+    ///   - bodyHighlightColor: 按下普通正文时的字色；为空时用略透明的 `textColor`。
     ///   - lineSpacing: 行间距，单位 point。
     ///   - alignment: 水平对齐。
     ///   - lineBreakMode: 换行方式。
@@ -89,6 +92,7 @@ public struct ZHHTextStyle {
         truncationColor: UIColor = .link,
         truncationFont: UIFont? = nil,
         highlightColor: UIColor = .quaternarySystemFill,
+        bodyHighlightColor: UIColor? = nil,
         lineSpacing: CGFloat = 2,
         alignment: NSTextAlignment = .natural,
         lineBreakMode: NSLineBreakMode = .byCharWrapping
@@ -103,6 +107,7 @@ public struct ZHHTextStyle {
         self.truncationColor = truncationColor
         self.truncationFont = truncationFont
         self.highlightColor = highlightColor
+        self.bodyHighlightColor = bodyHighlightColor
         self.lineSpacing = lineSpacing
         self.alignment = alignment
         self.lineBreakMode = lineBreakMode

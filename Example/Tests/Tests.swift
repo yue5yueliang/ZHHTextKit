@@ -560,6 +560,226 @@ final class ZHHTextLabelTests: XCTestCase {
         XCTAssertTrue(imageContainsInk(image))
     }
 
+    func testBodyTapDisabledByDefault() {
+        let label = makeLabel(width: 180)
+        label.text = "我已阅读并同意协议"
+        let size = label.sizeThatFits(CGSize(width: 180, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 180, height: size.height)
+
+        var bodyTaps = 0
+        label.onTapBody = { bodyTaps += 1 }
+        guard let point = bodyPoint(label) else {
+            return XCTFail("没有找到正文字形")
+        }
+        label.performInteraction(at: point)
+        XCTAssertEqual(bodyTaps, 0)
+        XCTAssertNil(label.hitTest(point, with: nil))
+    }
+
+    func testBodyTapFiresWhenEnabledAndSkipsLinks() {
+        let label = makeLabel(width: 220)
+        label.allowsBodyTap = true
+        let plain = "同意 "
+        let linkText = "《用户协议》"
+        let full = plain + linkText
+        let linkRange = (full as NSString).range(of: linkText)
+        label.apply(ZHHTextParseResult(
+            attributedText: NSAttributedString(string: full, attributes: bodyAttributes()),
+            links: [
+                ZHHTextLink(
+                    kind: .custom(ZHHTextCustomLink(identifier: "agreement")),
+                    range: linkRange,
+                    text: linkText
+                )
+            ]
+        ))
+        let size = label.sizeThatFits(CGSize(width: 220, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 220, height: size.height)
+
+        var bodyTaps = 0
+        var linkTaps = 0
+        label.onTapBody = { bodyTaps += 1 }
+        label.onTapLink = { _ in linkTaps += 1 }
+
+        guard let bodyPoint = bodyPoint(label) else {
+            return XCTFail("没有找到普通正文")
+        }
+        label.performInteraction(at: bodyPoint)
+        XCTAssertEqual(bodyTaps, 1)
+        XCTAssertEqual(linkTaps, 0)
+
+        guard let linkPoint = pointOfLink(label) else {
+            return XCTFail("没有找到协议链接")
+        }
+        label.performInteraction(at: linkPoint)
+        XCTAssertEqual(bodyTaps, 1)
+        XCTAssertEqual(linkTaps, 1)
+    }
+
+    func testLongPressDisabledByDefault() {
+        let label = makeLabel(width: 180)
+        label.text = "可复制的正文"
+        let size = label.sizeThatFits(CGSize(width: 180, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 180, height: size.height)
+
+        var pressed = 0
+        label.onLongPress = { _ in pressed += 1 }
+        label.performLongPress(at: CGPoint(x: 20, y: 10))
+        XCTAssertEqual(pressed, 0)
+    }
+
+    func testLongPressDeliversContextWithoutCopying() {
+        let label = makeLabel(width: 220)
+        label.allowsLongPressCopy = true
+        let plain = "同意 "
+        let linkText = "《用户协议》"
+        let full = plain + linkText
+        let linkRange = (full as NSString).range(of: linkText)
+        label.apply(ZHHTextParseResult(
+            attributedText: NSAttributedString(string: full, attributes: bodyAttributes()),
+            links: [
+                ZHHTextLink(
+                    kind: .custom(ZHHTextCustomLink(identifier: "agreement")),
+                    range: linkRange,
+                    text: linkText
+                )
+            ]
+        ))
+        let size = label.sizeThatFits(CGSize(width: 220, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 220, height: size.height)
+
+        let beforePasteboard = UIPasteboard.general.string
+        var info: ZHHTextLongPressInfo?
+        label.onLongPress = { info = $0 }
+
+        guard let bodyPoint = bodyPoint(label) else {
+            return XCTFail("没有找到普通正文")
+        }
+        label.performLongPress(at: bodyPoint)
+        XCTAssertEqual(info?.kind, .body)
+        XCTAssertEqual(info?.plainText, full)
+        XCTAssertEqual(info?.attributedText.string, full)
+        XCTAssertNotNil(info?.displayRange)
+        XCTAssertEqual(UIPasteboard.general.string, beforePasteboard)
+
+        guard let linkPoint = pointOfLink(label) else {
+            return XCTFail("没有找到协议链接")
+        }
+        label.performLongPress(at: linkPoint)
+        guard case .link(let link) = info?.kind else {
+            return XCTFail("长按链接应回传 link kind")
+        }
+        XCTAssertEqual(link.text, linkText)
+    }
+
+    func testBodyTapAcceptsPaddedHotZone() {
+        let label = makeLabel(width: 220)
+        label.allowsBodyTap = true
+        label.text = "我已阅读并同意"
+        let size = label.sizeThatFits(CGSize(width: 220, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 220, height: size.height)
+
+        guard let exact = bodyPoint(label) else {
+            return XCTFail("没有找到正文字形")
+        }
+        // 略偏到字形下方，仍应落在外扩热区内。
+        let padded = CGPoint(x: exact.x, y: exact.y + 8)
+        var bodyTaps = 0
+        label.onTapBody = { bodyTaps += 1 }
+        label.performInteraction(at: padded)
+        XCTAssertEqual(bodyTaps, 1)
+        XCTAssertNotNil(label.hitTest(padded, with: nil))
+    }
+
+    func testBodyTapBetweenAdjacentLinksIsNotStolenByLinkPadding() {
+        let label = makeLabel(width: 320)
+        label.allowsBodyTap = true
+        let left = "《用户协议》"
+        let middle = "和"
+        let right = "《隐私政策》"
+        let full = left + middle + right
+        let leftRange = (full as NSString).range(of: left)
+        let rightRange = (full as NSString).range(of: right)
+        let middleRange = (full as NSString).range(of: middle)
+        label.apply(ZHHTextParseResult(
+            attributedText: NSAttributedString(string: full, attributes: bodyAttributes()),
+            links: [
+                ZHHTextLink(
+                    kind: .custom(ZHHTextCustomLink(identifier: "user-agreement")),
+                    range: leftRange,
+                    text: left
+                ),
+                ZHHTextLink(
+                    kind: .custom(ZHHTextCustomLink(identifier: "privacy")),
+                    range: rightRange,
+                    text: right
+                )
+            ]
+        ))
+        let size = label.sizeThatFits(CGSize(width: 320, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 320, height: size.height)
+
+        let layout = currentLayout(label, width: 320)
+        guard let middleRect = layout.lineLayout.rects(for: middleRange).first else {
+            return XCTFail("找不到「和」的字形框")
+        }
+        let point = CGPoint(x: middleRect.midX, y: middleRect.midY)
+        let action = layout.lineLayout.hit(
+            at: point,
+            displayText: layout.displayText,
+            linksByID: layout.linksByID,
+            allowsBodyTap: true
+        )
+        guard case .body = action?.kind else {
+            return XCTFail("点「和」应命中正文，不能被两侧链接热区抢走")
+        }
+
+        var bodyTaps = 0
+        var linkTaps = 0
+        label.onTapBody = { bodyTaps += 1 }
+        label.onTapLink = { _ in linkTaps += 1 }
+        label.performInteraction(at: point)
+        XCTAssertEqual(bodyTaps, 1)
+        XCTAssertEqual(linkTaps, 0)
+    }
+
+    func testBodyTapHighlightCoversContiguousPlainRun() {
+        let label = makeLabel(width: 260)
+        label.allowsBodyTap = true
+        let plain = "我已阅读并同意"
+        let linkText = "《用户协议》"
+        let full = plain + linkText
+        let linkRange = (full as NSString).range(of: linkText)
+        label.apply(ZHHTextParseResult(
+            attributedText: NSAttributedString(string: full, attributes: bodyAttributes()),
+            links: [
+                ZHHTextLink(
+                    kind: .custom(ZHHTextCustomLink(identifier: "agreement")),
+                    range: linkRange,
+                    text: linkText
+                )
+            ]
+        ))
+        let size = label.sizeThatFits(CGSize(width: 260, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 260, height: size.height)
+
+        guard let point = bodyPoint(label) else {
+            return XCTFail("没有找到普通正文")
+        }
+        let width = label.bounds.width
+        let layout = currentLayout(label, width: width)
+        let action = layout.lineLayout.hit(
+            at: point,
+            displayText: layout.displayText,
+            linksByID: layout.linksByID,
+            allowsBodyTap: true
+        )
+        guard case .body = action?.kind else {
+            return XCTFail("应命中正文")
+        }
+        XCTAssertEqual(action?.displayRange, NSRange(location: 0, length: (plain as NSString).length))
+    }
+
     private func makeLabel(width: CGFloat) -> ZHHTextLabel {
         let label = ZHHTextLabel(frame: CGRect(x: 0, y: 0, width: width, height: 80))
         var style = ZHHTextStyle()
@@ -629,6 +849,28 @@ final class ZHHTextLabelTests: XCTestCase {
                 x += 4
             }
             y += 3
+        }
+        return nil
+    }
+
+    /// 找一个命中普通正文、且不是链接的点。临时打开 `allowsBodyTap` 做探测。
+    private func bodyPoint(_ label: ZHHTextLabel) -> CGPoint? {
+        let previous = label.allowsBodyTap
+        label.allowsBodyTap = true
+        defer { label.allowsBodyTap = previous }
+        var y: CGFloat = 0
+        while y <= label.bounds.height {
+            var x: CGFloat = 0
+            while x <= label.bounds.width {
+                let point = CGPoint(x: x, y: y)
+                if label.link(at: point) == nil,
+                   let action = label.hitTest(point, with: nil),
+                   action === label {
+                    return point
+                }
+                x += 3
+            }
+            y += 2
         }
         return nil
     }

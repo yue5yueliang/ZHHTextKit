@@ -10,7 +10,7 @@ import UIKit
 
 /// 富文本展示视图。负责行数、截断 token 和点击分发，不负责识别话题或链接语法。
 ///
-/// 水平排版。后续若增加竖排，仍通过 `apply`、`text` 和 `onTapLink` 使用，不另开一套数据接口。
+/// 水平排版。后续若增加竖排，仍通过 `apply`、`text`、`onTapLink`、可选的 `onTapBody` 与 `onLongPress` 使用，不另开一套数据接口。
 /// 链接的 `range` 始终相对未截断全文。完全落在被裁掉区域里的链接不可点；与可见区有交集的链接保持可点，回调里的 range 仍是原文区间。
 ///
 /// 列表复用时把展开态放在数据模型上，并为可见区域附近的数据调用 `ZHHTextLayoutPrefetcher`。
@@ -49,12 +49,22 @@ open class ZHHTextLabel: UIView {
     private var layoutGeneration = 0
     /// 按下高亮的展示串区间。
     private var highlightedRange: NSRange?
+    /// 当前按下是否用前景字色高亮（正文）；否则用背景底。
+    private var highlightUsesForeground = false
     /// 当前手指按下命中的动作。
     private var activeHit: ZHHTextHitAction?
     /// 行内视图附件：身份到宿主视图。
     private var attachmentHosts: [ObjectIdentifier: UIView] = [:]
     /// 行内图层附件：身份到子图层。
     private var attachmentLayers: [ObjectIdentifier: CALayer] = [:]
+    /// 长按手势；仅在 `allowsLongPressCopy` 时启用。
+    private lazy var longPressGesture: UILongPressGestureRecognizer = {
+        let gesture = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        gesture.minimumPressDuration = 0.45
+        gesture.cancelsTouchesInView = true
+        gesture.isEnabled = false
+        return gesture
+    }()
 
     // MARK: - 公开属性
 
@@ -208,6 +218,28 @@ open class ZHHTextLabel: UIView {
     /// 点击「全文 / 收起」后回调。参数是切换后的 `isExpanded`。视图会先更新状态再回调。
     public var onTapExpand: ((Bool) -> Void)?
 
+    /// 是否允许点击普通正文。默认 `false`，Feed 等列表保持现状；协议勾选等场景可打开。
+    ///
+    /// 打开后，点在非链接、非截断 token 的字形上会走 `onTapBody`。命中优先级仍是：截断 token > 链接 > 正文。
+    public var allowsBodyTap: Bool = false
+
+    /// 点击普通正文时回调。仅在 `allowsBodyTap == true` 时生效。
+    ///
+    /// 按下时对连续正文段做字色高亮（`bodyHighlightColor`，默认略淡的正文色），不铺背景。
+    public var onTapBody: (() -> Void)?
+
+    /// 是否允许长按回调。默认 `false`。
+    ///
+    /// 开启后长按会走 `onLongPress`，并取消本次短按；库不弹菜单、不写剪贴板。
+    public var allowsLongPressCopy: Bool = false {
+        didSet {
+            longPressGesture.isEnabled = allowsLongPressCopy
+        }
+    }
+
+    /// 长按回调。仅在 `allowsLongPressCopy == true` 时生效；内容由业务自行组装菜单或复制。
+    public var onLongPress: ((ZHHTextLongPressInfo) -> Void)?
+
     /// 跨 cell 共享的布局缓存。命中时直接复用排版，避免重复计算和串内容。
     public var layoutCache: ZHHTextLayoutCache?
 
@@ -262,6 +294,14 @@ open class ZHHTextLabel: UIView {
         activate(action)
     }
 
+    /// 在指定点执行一次长按回调（单测用）。
+    /// - Parameter point: 相对 bounds 的点。
+    func performLongPress(at point: CGPoint) {
+        guard allowsLongPressCopy else { return }
+        clearHighlight()
+        onLongPress?(makeLongPressInfo(at: point))
+    }
+
     // MARK: - 布局与绘制
 
     open override func sizeThatFits(_ size: CGSize) -> CGSize {
@@ -300,12 +340,20 @@ open class ZHHTextLabel: UIView {
         super.draw(rect)
         guard bounds.width > 0, bounds.height > 0, let context = UIGraphicsGetCurrentContext() else { return }
         let result = layout(constrainedWidth: bounds.width)
-        let color = style.highlightColor.resolvedColor(with: traitCollection)
+        let highlightStyle: ZHHTextLineLayout.PressHighlightStyle = highlightUsesForeground ? .foreground : .background
+        let color: UIColor
+        if highlightUsesForeground {
+            color = (style.bodyHighlightColor ?? style.textColor.withAlphaComponent(0.45))
+                .resolvedColor(with: traitCollection)
+        } else {
+            color = style.highlightColor.resolvedColor(with: traitCollection)
+        }
         result.lineLayout.draw(
             in: context,
             text: result.displayText,
             highlight: highlightedRange,
-            highlightColor: color
+            highlightColor: color,
+            highlightStyle: highlightStyle
         )
         placeViewAttachments(result)
     }
@@ -328,8 +376,18 @@ open class ZHHTextLabel: UIView {
                 return hit
             }
         }
-        guard hitAction(at: point) != nil else { return nil }
-        return self
+        // 开启长按时整块可接手势；否则仅在有可点命中时拦截。
+        if allowsLongPressCopy || hitAction(at: point) != nil {
+            return self
+        }
+        return nil
+    }
+
+    @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+        guard allowsLongPressCopy, gesture.state == .began else { return }
+        let point = gesture.location(in: self)
+        clearHighlight()
+        onLongPress?(makeLongPressInfo(at: point))
     }
 
     open override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -339,6 +397,7 @@ open class ZHHTextLabel: UIView {
         }
         activeHit = action
         highlightedRange = action.displayRange
+        highlightUsesForeground = (action.kind == .body)
         setNeedsDisplay()
     }
 
@@ -346,10 +405,12 @@ open class ZHHTextLabel: UIView {
         guard let point = touches.first?.location(in: self) else { return }
         guard let action = hitAction(at: point), action.kind == activeHit?.kind else {
             highlightedRange = nil
+            highlightUsesForeground = false
             setNeedsDisplay()
             return
         }
         highlightedRange = action.displayRange
+        highlightUsesForeground = (action.kind == .body)
         setNeedsDisplay()
     }
 
@@ -381,6 +442,7 @@ private extension ZHHTextLabel {
         accessibilityTraits = .staticText
         setContentCompressionResistancePriority(.required, for: .vertical)
         setContentHuggingPriority(.required, for: .vertical)
+        addGestureRecognizer(longPressGesture)
     }
 }
 
@@ -424,6 +486,7 @@ private extension ZHHTextLabel {
         cachedLayout = nil
         cachedLayoutWidth = nil
         highlightedRange = nil
+        highlightUsesForeground = false
         activeHit = nil
         accessibilityLabel = storedText
         invalidateIntrinsicContentSize()
@@ -500,7 +563,7 @@ private extension ZHHTextLabel {
 
 private extension ZHHTextLabel {
 
-    /// 分发链接点击或切换展开态。
+    /// 分发链接点击、切换展开态，或正文点击。
     /// - Parameter action: 命中结果。
     func activate(_ action: ZHHTextHitAction) {
         switch action.kind {
@@ -509,6 +572,8 @@ private extension ZHHTextLabel {
         case .expand:
             isExpanded = !isExpanded
             onTapExpand?(isExpanded)
+        case .body:
+            onTapBody?()
         }
     }
 
@@ -581,20 +646,71 @@ private extension ZHHTextLabel {
         }
     }
 
-    /// 命中链接或截断 token。
+    /// 命中链接、截断 token，或（开启后）普通正文。
     /// - Parameter point: 相对 bounds 的点。
     /// - Returns: 命中动作；点在空白处为 nil。
     func hitAction(at point: CGPoint) -> ZHHTextHitAction? {
+        hitAction(at: point, allowsBodyTap: allowsBodyTap)
+    }
+
+    /// 命中探测。
+    /// - Parameters:
+    ///   - point: 相对 bounds 的点。
+    ///   - allowsBodyTap: 是否把普通正文算作命中。
+    /// - Returns: 命中动作；点在空白处为 nil。
+    func hitAction(at point: CGPoint, allowsBodyTap: Bool) -> ZHHTextHitAction? {
         let width = bounds.width > 0 ? bounds.width : preferredMaxLayoutWidth
         guard width > 0 else { return nil }
         let result = layout(constrainedWidth: width)
-        return result.lineLayout.hit(at: point, displayText: result.displayText, linksByID: result.linksByID)
+        return result.lineLayout.hit(
+            at: point,
+            displayText: result.displayText,
+            linksByID: result.linksByID,
+            allowsBodyTap: allowsBodyTap
+        )
+    }
+
+    /// 组装长按回调上下文。分类时强制探测正文，不依赖 `allowsBodyTap`。
+    func makeLongPressInfo(at point: CGPoint) -> ZHHTextLongPressInfo {
+        let width = bounds.width > 0 ? bounds.width : preferredMaxLayoutWidth
+        let result = width > 0 ? layout(constrainedWidth: width) : nil
+        let attributed = storedAttributedText ?? NSAttributedString()
+        let plain = storedText ?? attributed.string
+        let visible = result?.displayText.string ?? plain
+
+        let action = hitAction(at: point, allowsBodyTap: true)
+        let kind: ZHHTextLongPressInfo.Kind
+        let displayRange: NSRange?
+        switch action?.kind {
+        case .link(let link):
+            kind = .link(link)
+            displayRange = action?.displayRange
+        case .expand:
+            kind = .expand
+            displayRange = action?.displayRange
+        case .body:
+            kind = .body
+            displayRange = action?.displayRange
+        case .none:
+            kind = .empty
+            displayRange = nil
+        }
+
+        return ZHHTextLongPressInfo(
+            point: point,
+            kind: kind,
+            plainText: plain,
+            visibleText: visible,
+            attributedText: attributed,
+            displayRange: displayRange
+        )
     }
 
     /// 清除按下高亮和当前命中。
     func clearHighlight() {
         activeHit = nil
         highlightedRange = nil
+        highlightUsesForeground = false
         setNeedsDisplay()
     }
 }

@@ -16,7 +16,7 @@ enum ZHHTextAttribute {
     static let truncation = NSAttributedString.Key("com.zhhtext.truncation")
 }
 
-/// 一次命中结果：正文链接或展开 / 收起。
+/// 一次命中结果：正文链接、展开 / 收起，或普通正文。
 struct ZHHTextHitAction: Equatable {
     /// 命中种类。
     enum Kind: Equatable {
@@ -24,6 +24,8 @@ struct ZHHTextHitAction: Equatable {
         case link(ZHHTextLink)
         /// 截断 token。
         case expand
+        /// 普通正文（非链接、非截断 token）。
+        case body
     }
 
     /// 命中种类。
