@@ -1,3 +1,11 @@
+# CocoaPods Specs 源（使用 Git 源，避免 CDN 网络波动）
+source 'https://github.com/CocoaPods/Specs.git'
+
+##忽略.cocoapods中多个specs源引起的警告问题
+install! 'cocoapods', :warn_for_unused_master_specs_repo => false
+
+inhibit_all_warnings!
+
 use_frameworks!
 
 platform :ios, '15.0'

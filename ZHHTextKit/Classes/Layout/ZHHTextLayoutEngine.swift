@@ -207,7 +207,10 @@ private extension ZHHTextLayoutEngine {
         )
     }
 
-    /// 折叠态截断片段：自定义 token 或省略号 +「全文」。
+    /// 折叠态截断片段：自定义 token，或默认「…」+「全文」。
+    ///
+    /// 默认拼装时，「…」用正文色，「全文」用截断色；整段仍由调用方标成同一展开热区。
+    /// 自定义 `truncationToken` 整段沿用原样，不做分色。
     static func collapsedToken(
         request: ZHHTextLayoutRequest,
         source: NSAttributedString
@@ -226,9 +229,27 @@ private extension ZHHTextLayoutEngine {
             return ZHHTextRunAttachment.prepare(mutable, fallbackFont: request.style.font)
         }
         let includeWord = request.showsCollapsedToken && !request.collapsedLinkText.isEmpty
-        let token = request.truncationEllipsis + (includeWord ? request.collapsedLinkText : "")
-        if token.isEmpty { return NSAttributedString() }
-        return NSAttributedString(string: token, attributes: tokenAttributes(request: request, source: source))
+        let ellipsis = request.truncationEllipsis
+        if ellipsis.isEmpty && !includeWord { return NSAttributedString() }
+
+        let mutable = NSMutableAttributedString()
+        if !ellipsis.isEmpty {
+            mutable.append(
+                NSAttributedString(
+                    string: ellipsis,
+                    attributes: ellipsisAttributes(request: request, source: source)
+                )
+            )
+        }
+        if includeWord {
+            mutable.append(
+                NSAttributedString(
+                    string: request.collapsedLinkText,
+                    attributes: tokenAttributes(request: request, source: source)
+                )
+            )
+        }
+        return mutable
     }
 
     /// 二分找最长前缀，使拼上 token 后仍不超过行数。
@@ -319,7 +340,19 @@ private extension ZHHTextLayoutEngine {
         return text.attributedSubstring(from: NSRange(location: 0, length: safe))
     }
 
-    /// 截断文案属性；尽量继承正文段落样式。
+    /// 折叠省略号属性：正文色/字体，尽量继承正文段落样式。
+    static func ellipsisAttributes(
+        request: ZHHTextLayoutRequest,
+        source: NSAttributedString
+    ) -> [NSAttributedString.Key: Any] {
+        var attributes = request.style.attributes(for: .body)
+        if source.length > 0, let paragraph = source.attribute(.paragraphStyle, at: 0, effectiveRange: nil) {
+            attributes[.paragraphStyle] = paragraph
+        }
+        return attributes
+    }
+
+    /// 「全文 / 收起」属性；尽量继承正文段落样式。
     static func tokenAttributes(
         request: ZHHTextLayoutRequest,
         source: NSAttributedString

@@ -268,6 +268,29 @@ final class ZHHTextLayoutTests: XCTestCase {
         XCTAssertLessThanOrEqual(layout.lineLayout.lines.count, 2)
     }
 
+    func testDefaultCollapsedTokenColorsEllipsisAsBodyAndWordAsTruncation() {
+        let text = String(repeating: "正文", count: 40)
+        let layout = makeLayout(text, lines: 2, expanded: false)
+        XCTAssertTrue(layout.isTruncated)
+        XCTAssertTrue(layout.displayText.string.hasSuffix("…全文"))
+
+        let display = layout.displayText
+        let ellipsisRange = (display.string as NSString).range(of: "…", options: .backwards)
+        let wordRange = (display.string as NSString).range(of: "全文", options: .backwards)
+        XCTAssertNotEqual(ellipsisRange.location, NSNotFound)
+        XCTAssertNotEqual(wordRange.location, NSNotFound)
+
+        let ellipsisColor = display.attribute(.foregroundColor, at: ellipsisRange.location, effectiveRange: nil) as? UIColor
+        let wordColor = display.attribute(.foregroundColor, at: wordRange.location, effectiveRange: nil) as? UIColor
+        XCTAssertEqual(ellipsisColor, bodyStyle().textColor)
+        XCTAssertEqual(wordColor, bodyStyle().truncationColor)
+
+        guard let truncationRange = layout.truncationRange else {
+            return XCTFail("折叠热区应覆盖整段默认 token")
+        }
+        XCTAssertEqual(truncationRange, NSUnionRange(ellipsisRange, wordRange))
+    }
+
     func testExpandedTextKeepsTailAndCollapseToken() {
         let tail = "TAILMARKER"
         let text = String(repeating: "正文", count: 40) + tail
