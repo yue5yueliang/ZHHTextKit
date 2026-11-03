@@ -75,6 +75,12 @@ public enum ZHHTextEditing {
 /// 输入 `@` / `#` 时可通过 `onSpecialTrigger` 弹出选择页，不要在回调里无条件 insert。
 /// `@` 提及整段删除；`#` 话题主格式为单井号，可进光标、逐字删，改字后丢掉本地 id。
 /// 正式跳转用的 id 以服务端发布 / 回显为准。中文联想未上屏时不改写文字。
+///
+/// ## 占位与字数
+/// - `placeholder` / `placeholderColor`：空文且无未上屏联想时显示；布局对齐 `textContainerInset`，不挡触摸。
+/// - `maxTextLength`：按 `String.count`（Swift 字素）计数，与发布正文一致；`@提及` / `#话题` 按展示原文长度计入（含 `@` / `#`）。
+/// - 超限时整段拒绝插入（键盘、粘贴、`insert(mention:)` / `insert(topic:)`），并触发 `onReachMaxLength`；不静默截断半个原子提及。删除 / 退格不受限。
+/// - 中文联想未上屏时不按中间态拦输入；确认上屏后再按最终长度判断。
 open class ZHHTextView: UITextView {
 
     // MARK: - 内部 token
@@ -115,6 +121,14 @@ open class ZHHTextView: UITextView {
     private var pendingSpecial: ZHHTextSpecialTrigger?
     /// 上次选区起点，用于判断光标移动方向并跳过整段。
     private var lastSelectionLocation = 0
+    /// 空文占位标签；不参与编辑命中。
+    private lazy var placeholderLabel: UILabel = {
+        let label = UILabel()
+        label.numberOfLines = 0
+        label.isUserInteractionEnabled = false
+        label.isHidden = true
+        return label
+    }()
 
     // MARK: - 公开属性
 
@@ -132,6 +146,24 @@ open class ZHHTextView: UITextView {
 
     /// 是否在输入 `@` / `#` 时触发 `onSpecialTrigger`。默认 `true`。
     public var detectsSpecialTrigger = true
+
+    /// 空文占位文案。默认 `nil`（不显示）。有内容或中文联想未上屏时隐藏。
+    public var placeholder: String? {
+        didSet { refreshPlaceholder() }
+    }
+
+    /// 占位颜色。默认 `tertiaryLabel`；深浅色随 `traitCollection` 刷新。
+    public var placeholderColor: UIColor = .tertiaryLabel {
+        didSet { placeholderLabel.textColor = placeholderColor }
+    }
+
+    /// 正文最大字数（`String.count` / 字素）。默认 `nil` 表示不限制。
+    ///
+    /// 计数与发布 `text` 一致；提及 / 话题按展示原文计入。超限插入整段拒绝并回调 `onReachMaxLength`。
+    public var maxTextLength: Int?
+
+    /// 触达 `maxTextLength` 且本次插入被拒绝时回调（便于业务 Toast）。
+    public var onReachMaxLength: (() -> Void)?
 
     /// 正文和链接的样式。会写回 `parser.style`。
     public var style: ZHHTextStyle {
@@ -198,6 +230,27 @@ open class ZHHTextView: UITextView {
             seedTokensFromParserIfNeeded()
             let length = ((newValue ?? "") as NSString).length
             restyle(preserving: NSRange(location: length, length: 0))
+            refreshPlaceholder()
+        }
+    }
+
+    open override var textContainerInset: UIEdgeInsets {
+        get { super.textContainerInset }
+        set {
+            super.textContainerInset = newValue
+            setNeedsLayout()
+        }
+    }
+
+    open override func layoutSubviews() {
+        super.layoutSubviews()
+        layoutPlaceholderLabel()
+    }
+
+    open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
+            placeholderLabel.textColor = placeholderColor
         }
     }
 
@@ -307,8 +360,10 @@ open class ZHHTextView: UITextView {
     // MARK: - 输入覆盖
 
     open override func insertText(_ text: String) {
+        // 中文联想未上屏：不按中间态拦长度，交给系统；确认后再走普通路径。
         guard markedTextRange == nil else {
             super.insertText(text)
+            refreshPlaceholder()
             return
         }
 
@@ -331,13 +386,34 @@ open class ZHHTextView: UITextView {
             selectedRange = NSRange(location: link.range.location + link.range.length, length: 0)
         }
 
+        // 粘贴或输入超长：整段拒绝，不截断半个 token。
+        guard allowInserting(text, replacing: selectedRange) else { return }
+
         applyReplacement(selectedRange, insertedLength: (text as NSString).length)
         super.insertText(text)
+    }
+
+    open override func paste(_ sender: Any?) {
+        let pasteboard = UIPasteboard.general.string ?? ""
+        guard markedTextRange == nil else {
+            super.paste(sender)
+            refreshPlaceholder()
+            return
+        }
+        var range = selectedRange
+        if range.length > 0,
+           let expanded = ZHHTextEditing.deletionRange(for: range, links: editResult.links) {
+            range = expanded
+            selectedRange = expanded
+        }
+        guard allowInserting(pasteboard, replacing: range) else { return }
+        super.paste(sender)
     }
 
     open override func deleteBackward() {
         guard markedTextRange == nil else {
             super.deleteBackward()
+            refreshPlaceholder()
             return
         }
         pendingSpecial = nil
@@ -365,10 +441,12 @@ open class ZHHTextView: UITextView {
 
 private extension ZHHTextView {
 
-    /// 公共初始化：默认解析器与文本变化观察。
+    /// 公共初始化：默认解析器、占位层与文本变化观察。
     func commonInit() {
         backgroundColor = .clear
         adjustsFontForContentSizeCategory = true
+        addSubview(placeholderLabel)
+        placeholderLabel.textColor = placeholderColor
         parser = ZHHTextParser(style: storedStyle)
         NotificationCenter.default.addObserver(
             self,
@@ -376,6 +454,7 @@ private extension ZHHTextView {
             name: UITextView.textDidChangeNotification,
             object: self
         )
+        refreshPlaceholder()
     }
 }
 
@@ -414,6 +493,7 @@ private extension ZHHTextView {
         if shouldInsertLeadingSpaceBeforeSpecial() {
             snippet = " " + trigger
         }
+        guard allowInserting(snippet, replacing: selection) else { return }
         applyReplacement(selection, insertedLength: (snippet as NSString).length)
         super.insertText(snippet)
         pendingSpecial = kind
@@ -499,6 +579,8 @@ private extension ZHHTextView {
             range: NSRange(location: tokenStart, length: (raw as NSString).length)
         )
         let replace = NSRange(location: replaceLocation, length: replaceLength)
+        // 整段提及 / 话题（含两侧空格）超限则整段拒绝，避免半截 token。
+        guard allowInserting(pieces, replacing: replace) else { return }
         applyReplacement(replace, insertedLength: (pieces as NSString).length, inserting: token)
         insertPlain(pieces, at: replace)
         pendingSpecial = nil
@@ -617,7 +699,13 @@ private extension ZHHTextView {
     /// 系统文本变化通知。联想未上屏或正在重写时跳过。
     @objc func plainTextDidChange() {
         guard !isRestyling else { return }
+        // 联想过程中只刷新占位显隐；上色仍等 markedText 结束后再走。
+        if markedTextRange != nil {
+            refreshPlaceholder()
+            return
+        }
         restyle(preserving: selectedRange)
+        refreshPlaceholder()
     }
 
     /// 在指定选区插入纯文本，再按解析器上色。
@@ -631,12 +719,67 @@ private extension ZHHTextView {
         if safe.location + safe.length > current.length {
             safe.length = current.length - safe.location
         }
+        // 上限已在 insertAtomic / insertText 入口校验；此处只落字，避免先改 token 再拒绝。
         let next = current.replacingCharacters(in: safe, with: string) as String
         let caret = safe.location + (string as NSString).length
         isRestyling = true
         super.text = next
         isRestyling = false
         restyle(preserving: NSRange(location: caret, length: 0))
+    }
+
+    /// 若设置了 `maxTextLength`，判断把 `range` 换成 `insertion` 后是否超限。
+    ///
+    /// 超限时触发 `onReachMaxLength` 并返回 `false`。`maxTextLength == nil` 时始终允许。
+    @discardableResult
+    func allowInserting(_ insertion: String, replacing range: NSRange) -> Bool {
+        guard let limit = maxTextLength else { return true }
+        let next = text(afterReplacing: range, with: insertion)
+        guard next.count <= max(0, limit) else {
+            onReachMaxLength?()
+            return false
+        }
+        return true
+    }
+
+    /// 用 UTF-16 选区替换后的正文（再按 `String.count` 计字素）。
+    func text(afterReplacing range: NSRange, with insertion: String) -> String {
+        let current = (text ?? "") as NSString
+        var safe = range
+        if safe.location > current.length {
+            safe = NSRange(location: current.length, length: 0)
+        }
+        if safe.location + safe.length > current.length {
+            safe.length = max(0, current.length - safe.location)
+        }
+        return current.replacingCharacters(in: safe, with: insertion) as String
+    }
+
+    /// 刷新占位文案、颜色与显隐。
+    func refreshPlaceholder() {
+        let hasPlaceholder = !(placeholder?.isEmpty ?? true)
+        placeholderLabel.text = placeholder
+        placeholderLabel.font = font ?? storedStyle.font
+        placeholderLabel.textColor = placeholderColor
+        let isEmpty = (text ?? "").isEmpty
+        let isMarking = markedTextRange != nil
+        placeholderLabel.isHidden = !(hasPlaceholder && isEmpty && !isMarking)
+        if !placeholderLabel.isHidden {
+            layoutPlaceholderLabel()
+        }
+    }
+
+    /// 占位框对齐 `textContainerInset` 与 `lineFragmentPadding`。
+    func layoutPlaceholderLabel() {
+        guard !placeholderLabel.isHidden else { return }
+        let inset = textContainerInset
+        let pad = textContainer.lineFragmentPadding
+        let x = inset.left + pad
+        let y = inset.top
+        let width = bounds.width - inset.left - inset.right - pad * 2
+        guard width > 0 else { return }
+        let size = placeholderLabel.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        placeholderLabel.frame = CGRect(x: x, y: y, width: width, height: ceil(size.height))
     }
 
     /// 光标严格落在某个话题或提及内部时返回该链接。
@@ -714,6 +857,7 @@ private extension ZHHTextView {
         typingAttributes = storedStyle.attributes(for: .body)
         editResult = result
         isRestyling = false
+        refreshPlaceholder()
         onEdit?(result)
     }
 }

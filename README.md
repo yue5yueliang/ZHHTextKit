@@ -8,7 +8,7 @@
 
 ## 安装
 
-CocoaPods：
+### CocoaPods
 
 ```ruby
 pod 'ZHHTextKit'
@@ -20,7 +20,36 @@ pod 'ZHHTextKit'
 pod 'ZHHTextKit', :path => '../'
 ```
 
-Swift Package Manager 把仓库加为依赖，产品名是 `ZHHTextKit`。
+官方 Trunk 暂时发不出新版本时，可直接依赖 git 标签：
+
+```ruby
+pod 'ZHHTextKit', :git => 'https://github.com/yue5yueliang/ZHHTextKit.git', :tag => '1.0.5'
+```
+
+### Swift Package Manager
+
+仓库已提供 `Package.swift`，产品名是 `ZHHTextKit`。打好语义化 tag 后即可被 SPM 解析，无需额外上传。
+
+**Xcode**
+
+1. File → Add Package Dependencies…
+2. 填入：`https://github.com/yue5yueliang/ZHHTextKit.git`
+3. 规则选 Up to Next Major（或 Exact `1.0.5`）
+4. 把产品 `ZHHTextKit` 加到目标
+
+**Package.swift**
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/yue5yueliang/ZHHTextKit.git", from: "1.0.5")
+]
+```
+
+在 target 里引用：
+
+```swift
+.product(name: "ZHHTextKit", package: "ZHHTextKit")
+```
 
 ## 最小示例
 
@@ -138,7 +167,7 @@ preview.attributedText = ZHHTextChip.labelCompatible(editor.textStorage, aligned
 | M2 | 布局缓存、后台预计算、列表复用示例 | 已完成 |
 | M3 | 图片、视图、图层附件；自定义截断 token | 已完成 |
 | M4 | 富文本输入：@ / 话题插入；话题可编辑，@ 整段删 | 已完成 |
-| M5 | 自定义表情、胶囊标签正式 API；回归单测 | 已完成（`1.0.4`） |
+| M5 | 自定义表情、胶囊标签正式 API；回归单测 | 已完成（`1.0.5`） |
 
 ## 输入
 
@@ -147,6 +176,10 @@ preview.attributedText = ZHHTextChip.labelCompatible(editor.textStorage, aligned
 
 ```swift
 let editor = ZHHTextView()
+editor.placeholder = "说点什么吧，试试 @ 和 #"
+editor.placeholderColor = .tertiaryLabel
+editor.maxTextLength = 500 // nil = 不限制；按 String.count（字素）计，含 @/# 原文
+editor.onReachMaxLength = { /* Toast */ }
 editor.onSpecialTrigger = { trigger in
     // 只弹选人 / 选话题；选完再 insert。不要无条件 insert。
     presentPicker(for: trigger)
@@ -155,6 +188,8 @@ editor.insert(mention: ZHHTextMention(name: "小红", userID: "u-2002"))
 editor.insert(topic: ZHHTextTopic(name: "城市漫步", topicID: "t-200"))
 let document = editor.makePostDocument() // text + 已选 entities
 ```
+
+超限时整段拒绝插入（含粘贴与 `insert(mention:)` / `insert(topic:)`），不静默截断半个提及。
 
 ## 发布 / 回显契约
 

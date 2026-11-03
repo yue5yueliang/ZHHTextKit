@@ -61,6 +61,13 @@ final class EditorDemoViewController: UIViewController {
         editor.layer.cornerRadius = 8
         editor.clipsToBounds = true
         editor.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        editor.placeholder = "说点什么吧，试试 @ 和 #"
+        editor.placeholderColor = .tertiaryLabel
+        // Demo 用较小上限方便验收；业务可设 500 或不设。
+        editor.maxTextLength = 40
+        editor.onReachMaxLength = { [weak self] in
+            self?.summary.text = "已达字数上限（40）"
+        }
         editor.onSpecialTrigger = { [weak self] trigger in
             self?.presentPicker(for: trigger)
         }
@@ -68,7 +75,8 @@ final class EditorDemoViewController: UIViewController {
             self?.summary.text = EditorDemoViewController.describe(result)
         }
         editor.parser = parser
-        editor.text = "约 @小明 看 #周末去哪儿 ，详情 https://example.com"
+        // 空文便于看到占位；点工具栏或输入后占位会隐藏。
+        editor.text = ""
 
         previewLabel.numberOfLines = 0
         previewLabel.onTapLink = { [weak self] link in

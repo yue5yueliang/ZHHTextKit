@@ -1176,6 +1176,57 @@ final class ZHHTextEditorTests: XCTestCase {
         XCTAssertNotNil(document.jsonString())
     }
 
+    func testPlaceholderVisibleWhenEmptyAndHidesWithText() {
+        let editor = ZHHTextView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        editor.placeholder = "说点什么"
+        editor.layoutIfNeeded()
+        let label = editor.subviews.compactMap { $0 as? UILabel }.first { $0.text == "说点什么" }
+        XCTAssertNotNil(label)
+        XCTAssertEqual(label?.isHidden, false)
+
+        editor.text = "有字了"
+        XCTAssertEqual(label?.isHidden, true)
+
+        editor.text = ""
+        XCTAssertEqual(label?.isHidden, false)
+    }
+
+    func testMaxTextLengthBlocksInsertAndFiresCallback() {
+        let editor = ZHHTextView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        editor.maxTextLength = 5
+        var reached = 0
+        editor.onReachMaxLength = { reached += 1 }
+
+        editor.insertText("一二三四五")
+        XCTAssertEqual(editor.text, "一二三四五")
+        XCTAssertEqual(reached, 0)
+
+        editor.insertText("六")
+        XCTAssertEqual(editor.text, "一二三四五")
+        XCTAssertEqual(reached, 1)
+
+        // 整段粘贴式超长：拒绝且再回调。
+        editor.insertText("超长内容不会写入")
+        XCTAssertEqual(editor.text, "一二三四五")
+        XCTAssertEqual(reached, 2)
+    }
+
+    func testMaxTextLengthCountsMentionRawCharacters() {
+        let editor = ZHHTextView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        // "@小明 " 为 4 个字素；上限 3 时应拦下整段提及。
+        editor.maxTextLength = 3
+        var reached = 0
+        editor.onReachMaxLength = { reached += 1 }
+        editor.insert(mention: ZHHTextMention(name: "小明", userID: "u-1"))
+        XCTAssertEqual(editor.text, "")
+        XCTAssertEqual(reached, 1)
+
+        editor.maxTextLength = 10
+        editor.insert(mention: ZHHTextMention(name: "小明", userID: "u-1"))
+        XCTAssertEqual(editor.text, "@小明 ")
+        XCTAssertEqual((editor.text ?? "").count, 4)
+    }
+
     func testParserOverlaysServerEntitiesForDisplay() {
         let text = "约 @小明 看 #城市漫步"
         let document = ZHHTextPostDocument(
