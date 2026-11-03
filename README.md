@@ -138,7 +138,7 @@ preview.attributedText = ZHHTextChip.labelCompatible(editor.textStorage, aligned
 | M2 | 布局缓存、后台预计算、列表复用示例 | 已完成 |
 | M3 | 图片、视图、图层附件；自定义截断 token | 已完成 |
 | M4 | 富文本输入：@ / 话题插入；话题可编辑，@ 整段删 | 已完成 |
-| M5 | 自定义表情、胶囊标签正式 API；回归单测 | 已完成（`1.0.2`） |
+| M5 | 自定义表情、胶囊标签正式 API；回归单测 | 已完成（`1.0.3`） |
 
 ## 输入
 

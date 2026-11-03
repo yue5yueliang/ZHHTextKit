@@ -2,9 +2,9 @@ PODS:
   - LookinServer/Core (1.2.8)
   - LookinServer/Swift (1.2.8):
     - LookinServer/Core
-  - ZHHTextKit (1.0.2):
-    - ZHHTextKit/Source (= 1.0.2)
-  - ZHHTextKit/Source (1.0.2)
+  - ZHHTextKit (1.0.3):
+    - ZHHTextKit/Source (= 1.0.3)
+  - ZHHTextKit/Source (1.0.3)
 
 DEPENDENCIES:
   - LookinServer/Swift
@@ -20,7 +20,7 @@ EXTERNAL SOURCES:
 
 SPEC CHECKSUMS:
   LookinServer: 1b2b61c6402ae29fa22182d48f5cd067b4e99e80
-  ZHHTextKit: c3d0d6dfbee15ca1442d84c33f85e133984085b9
+  ZHHTextKit: 52a6be46711771866ce5696a034a28d78662c381
 
 PODFILE CHECKSUM: 6bcf3d44a68c8f63907957e4c30feaab7467b6aa
 

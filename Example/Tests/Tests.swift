@@ -520,6 +520,119 @@ final class ZHHTextLabelTests: XCTestCase {
         XCTAssertTrue(expandedLayout.displayText.string.contains("收起"))
     }
 
+    /// 有截断时，展开 / 收起热区的 hitTest 应落到 UIControl，且能切换 isExpanded。
+    func testExpandHitControlIsUIControlAndTogglesExpanded() {
+        let label = makeLabel(width: 120)
+        label.numberOfLines = 2
+        label.text = String(repeating: "正文", count: 40) + "TAILMARKER"
+        let collapsed = label.sizeThatFits(CGSize(width: 120, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 120, height: collapsed.height)
+        label.layoutIfNeeded()
+
+        let layout = currentLayout(label, width: 120)
+        guard let point = expandPoint(in: layout) else {
+            return XCTFail("没有找到全文热区")
+        }
+        // 宿主可据此判断 touch.view 是 UIControl，从而跳过单击暂停。
+        let hit = label.hitTest(point, with: nil)
+        XCTAssertTrue(hit is UIControl)
+        XCTAssertFalse(hit === label)
+
+        var states: [Bool] = []
+        label.onTapExpand = { states.append($0) }
+        (hit as? UIControl)?.sendActions(for: .touchUpInside)
+        XCTAssertEqual(states, [true])
+        XCTAssertTrue(label.isExpanded)
+
+        // 展开后正文变高，「收起」可能落在原 frame 之外，需同步拉高再测。
+        let expandedSize = label.sizeThatFits(CGSize(width: 120, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 120, height: expandedSize.height)
+        label.layoutIfNeeded()
+        let expandedLayout = currentLayout(label, width: 120)
+        guard let collapsePoint = expandPoint(in: expandedLayout) else {
+            return XCTFail("没有找到收起热区")
+        }
+        let collapseHit = label.hitTest(collapsePoint, with: nil)
+        XCTAssertTrue(collapseHit is UIControl)
+        (collapseHit as? UIControl)?.sendActions(for: .touchUpInside)
+        XCTAssertEqual(states, [true, false])
+        XCTAssertFalse(label.isExpanded)
+    }
+
+    /// 未截断时不应创建展开热区 UIControl，避免挡底层手势。
+    func testExpandHitControlAbsentWhenNotTruncated() {
+        let label = makeLabel(width: 180)
+        label.numberOfLines = 2
+        label.text = "短文本"
+        let size = label.sizeThatFits(CGSize(width: 180, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 180, height: size.height)
+        label.layoutIfNeeded()
+        XCTAssertFalse(label.isTruncated)
+
+        var y: CGFloat = 0
+        while y <= label.bounds.height {
+            var x: CGFloat = 0
+            while x <= label.bounds.width {
+                let hit = label.hitTest(CGPoint(x: x, y: y), with: nil)
+                XCTAssertFalse(hit is UIControl, "无截断时不应出现展开热区 UIControl")
+                x += 4
+            }
+            y += 3
+        }
+    }
+
+    /// 关闭折叠文案且无可点 token 时，即使发生截断也不应挂热区控件。
+    func testExpandHitControlAbsentWhenShowsCollapsedTokenDisabled() {
+        let label = makeLabel(width: 120)
+        label.numberOfLines = 2
+        label.showsCollapsedToken = false
+        label.collapsedLinkText = ""
+        label.text = String(repeating: "正文", count: 40)
+        let size = label.sizeThatFits(CGSize(width: 120, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 120, height: size.height)
+        label.layoutIfNeeded()
+        XCTAssertTrue(label.isTruncated)
+
+        var y: CGFloat = 0
+        while y <= label.bounds.height {
+            var x: CGFloat = 0
+            while x <= label.bounds.width {
+                XCTAssertFalse(
+                    label.hitTest(CGPoint(x: x, y: y), with: nil) is UIControl,
+                    "无可点展开文案时不应创建热区 UIControl"
+                )
+                x += 4
+            }
+            y += 3
+        }
+    }
+
+    /// 自定义 truncationToken 整段仍应由 UIControl 热区承接，并可展开。
+    func testCustomTruncationTokenUsesExpandHitControl() {
+        let label = makeLabel(width: 120)
+        label.numberOfLines = 2
+        label.truncationToken = NSAttributedString(
+            string: "...more",
+            attributes: bodyAttributes()
+        )
+        label.text = String(repeating: "正文", count: 40)
+        let size = label.sizeThatFits(CGSize(width: 120, height: 1000))
+        label.frame = CGRect(x: 0, y: 0, width: 120, height: size.height)
+        label.layoutIfNeeded()
+
+        let layout = currentLayout(label, width: 120)
+        guard let point = expandPoint(in: layout) else {
+            return XCTFail("自定义 truncationToken 应可点展开")
+        }
+        let hit = label.hitTest(point, with: nil)
+        XCTAssertTrue(hit is UIControl)
+        var expanded = false
+        label.onTapExpand = { expanded = $0 }
+        (hit as? UIControl)?.sendActions(for: .touchUpInside)
+        XCTAssertTrue(expanded)
+        XCTAssertTrue(label.isExpanded)
+    }
+
     func testReusedLabelDoesNotKeepPreviousLink() {
         let label = makeLabel(width: 220)
         label.numberOfLines = 1

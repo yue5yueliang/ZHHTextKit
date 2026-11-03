@@ -12,6 +12,7 @@ import UIKit
 ///
 /// 水平排版。后续若增加竖排，仍通过 `apply`、`text`、`onTapLink`、可选的 `onTapBody` 与 `onLongPress` 使用，不另开一套数据接口。
 /// 链接的 `range` 始终相对未截断全文。完全落在被裁掉区域里的链接不可点；与可见区有交集的链接保持可点，回调里的 range 仍是原文区间。
+/// 「全文 / 收起」热区由内部透明 `UIControl` 承接命中，便于宿主按 `UIControl` 排除单击暂停等手势；话题等链接仍由 Label 自身处理。
 ///
 /// 列表复用时把展开态放在数据模型上，并为可见区域附近的数据调用 `ZHHTextLayoutPrefetcher`。
 /// `layoutCache` 命中后不会把上一条内容画到当前 cell。
@@ -65,6 +66,33 @@ open class ZHHTextLabel: UIView {
         gesture.isEnabled = false
         return gesture
     }()
+    /// 承接「全文 / 收起」热区的透明控件。
+    ///
+    /// 视觉仍是内联 token，不额外画按钮；点击时 `touch.view` 落在 `UIControl` 上，
+    /// 便于短视频滑滑流等宿主按「跳过 UIControl」排除单击暂停手势。
+    /// 仅在存在可点截断 token 时启用；无 token 时隐藏，避免挡底层手势。
+    private lazy var expandHitControl: UIControl = {
+        let control = UIControl()
+        // 透明覆盖，不改变内联 token 的绘制外观。
+        control.backgroundColor = .clear
+        // 默认关闭；等排版算出 truncationRange 后再打开。
+        control.isHidden = true
+        control.isUserInteractionEnabled = false
+        // 无障碍继续走 Label 自身的 staticText，避免重复朗读。
+        control.isAccessibilityElement = false
+        control.addTarget(self, action: #selector(handleExpandControlTouchDown), for: .touchDown)
+        control.addTarget(self, action: #selector(handleExpandControlTouchUpInside), for: .touchUpInside)
+        control.addTarget(
+            self,
+            action: #selector(handleExpandControlTouchCancel),
+            for: [.touchUpOutside, .touchCancel, .touchDragExit]
+        )
+        return control
+    }()
+    /// 当前展开热区对应的展示串区间。
+    ///
+    /// 与 `layout.truncationRange` 对齐，供 control 按下时画高亮；无可点 token 时为 nil。
+    private var expandTokenDisplayRange: NSRange?
 
     // MARK: - 公开属性
 
@@ -321,7 +349,11 @@ open class ZHHTextLabel: UIView {
 
     open override func layoutSubviews() {
         super.layoutSubviews()
-        guard bounds.width > 0 else { return }
+        // 尚无宽度时无法排版，顺手清掉热区，避免复用残留。
+        guard bounds.width > 0 else {
+            hideExpandHitControl()
+            return
+        }
         if bounds.width != lastBoundsWidth {
             lastBoundsWidth = bounds.width
             if cachedLayoutWidth != bounds.width {
@@ -333,7 +365,10 @@ open class ZHHTextLabel: UIView {
                 invalidateIntrinsicContentSize()
             }
         }
-        placeViewAttachments(layout(constrainedWidth: bounds.width))
+        let result = layout(constrainedWidth: bounds.width)
+        placeViewAttachments(result)
+        // 宽度变化、展开切换、列表复用后都在这里同步热区 frame。
+        updateExpandHitControl(for: result)
     }
 
     open override func draw(_ rect: CGRect) {
@@ -356,6 +391,8 @@ open class ZHHTextLabel: UIView {
             highlightStyle: highlightStyle
         )
         placeViewAttachments(result)
+        // 异步排版或仅触发重绘时，同样刷新热区，避免与字形错位。
+        updateExpandHitControl(for: result)
     }
 
     open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
@@ -370,14 +407,30 @@ open class ZHHTextLabel: UIView {
     open override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard isUserInteractionEnabled, !isHidden, alpha > 0.01 else { return nil }
         guard self.point(inside: point, with: event) else { return nil }
+
+        // 展开热区优先落到 UIControl：宿主 `shouldReceive` 可用 `touch.view is UIControl` 跳过暂停。
+        if expandHitControl.isUserInteractionEnabled, !expandHitControl.isHidden {
+            let local = convert(point, to: expandHitControl)
+            if expandHitControl.point(inside: local, with: event) {
+                return expandHitControl
+            }
+        }
+
+        // 其余附件子视图照常命中；expandHitControl 已单独处理，这里跳过避免重复。
         for subview in subviews.reversed() {
+            if subview === expandHitControl { continue }
             let local = convert(point, to: subview)
             if let hit = subview.hitTest(local, with: event) {
                 return hit
             }
         }
         // 开启长按时整块可接手势；否则仅在有可点命中时拦截。
-        if allowsLongPressCopy || hitAction(at: point) != nil {
+        // 截断 token 已由 expandHitControl 承接，这里不再把 .expand 算作 Label 自身命中，
+        // 否则 touch.view 会落在普通 UIView 上，滑滑流单击暂停仍会触发。
+        if allowsLongPressCopy {
+            return self
+        }
+        if let action = hitAction(at: point), action.kind != .expand {
             return self
         }
         return nil
@@ -388,6 +441,30 @@ open class ZHHTextLabel: UIView {
         let point = gesture.location(in: self)
         clearHighlight()
         onLongPress?(makeLongPressInfo(at: point))
+    }
+
+    /// 展开热区按下：用截断 token 区间画背景高亮，与原先 Label 触摸路径观感一致。
+    @objc private func handleExpandControlTouchDown() {
+        guard let range = expandTokenDisplayRange else { return }
+        activeHit = ZHHTextHitAction(kind: .expand, displayRange: range)
+        highlightedRange = range
+        // 展开 token 用背景高亮，不用正文前景色。
+        highlightUsesForeground = false
+        setNeedsDisplay()
+    }
+
+    /// 展开热区抬起：清除高亮，并走与 `.expand` 相同的 `activate`（切换展开态 + `onTapExpand`）。
+    @objc private func handleExpandControlTouchUpInside() {
+        clearHighlight()
+        activate(ZHHTextHitAction(
+            kind: .expand,
+            displayRange: expandTokenDisplayRange ?? NSRange(location: 0, length: 0)
+        ))
+    }
+
+    /// 展开热区取消或拖出：只清高亮，不切换展开态。
+    @objc private func handleExpandControlTouchCancel() {
+        clearHighlight()
     }
 
     open override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -442,6 +519,8 @@ private extension ZHHTextLabel {
         accessibilityTraits = .staticText
         setContentCompressionResistancePriority(.required, for: .vertical)
         setContentHuggingPriority(.required, for: .vertical)
+        // 先挂上热区控件；默认隐藏，等有 truncationRange 再启用。
+        addSubview(expandHitControl)
         addGestureRecognizer(longPressGesture)
     }
 }
@@ -488,6 +567,9 @@ private extension ZHHTextLabel {
         highlightedRange = nil
         highlightUsesForeground = false
         activeHit = nil
+        // 内容一变，旧热区立刻失效，等下一次 layout/draw 再按新 truncationRange 重建。
+        expandTokenDisplayRange = nil
+        hideExpandHitControl()
         accessibilityLabel = storedText
         invalidateIntrinsicContentSize()
         setNeedsLayout()
@@ -575,6 +657,40 @@ private extension ZHHTextLabel {
         case .body:
             onTapBody?()
         }
+    }
+
+    /// 按截断 token 矩形更新展开热区 `UIControl`。
+    ///
+    /// 折叠态「…全文 / 自定义 truncationToken」、展开态「收起」共用此路径。
+    /// `truncationRange` 为空（未截断、仅省略号、或关闭 showsCollapsed/ExpandedToken）时隐藏控件，
+    /// 避免透明热区吞掉播放器等底层手势。
+    /// - Parameter layout: 当前宽度下的排版结果。
+    func updateExpandHitControl(for layout: ZHHTextLayout) {
+        guard let range = layout.truncationRange,
+              range.length > 0,
+              let union = layout.lineLayout.expandHitUnion(for: range),
+              union.width > 0,
+              union.height > 0 else {
+            hideExpandHitControl()
+            return
+        }
+        expandTokenDisplayRange = range
+        // frame 与 hitExpandToken 外扩一致，保证命中区域和手势过滤范围对齐。
+        expandHitControl.frame = union
+        expandHitControl.isHidden = false
+        expandHitControl.isUserInteractionEnabled = true
+        // 置于附件之上，避免行内视图挡住「全文 / 收起」。
+        bringSubviewToFront(expandHitControl)
+    }
+
+    /// 隐藏并禁用展开热区控件。
+    ///
+    /// 清空 frame，确保 `hitTest` 不会再落到该 `UIControl` 上。
+    func hideExpandHitControl() {
+        expandTokenDisplayRange = nil
+        expandHitControl.isHidden = true
+        expandHitControl.isUserInteractionEnabled = false
+        expandHitControl.frame = .zero
     }
 
     /// 按排版结果摆放行内视图和图层，并移除过期的宿主。

@@ -550,7 +550,40 @@ final class ZHHTextLineLayout {
         return max(border.cornerRadius, 2)
     }
 
+    /// 「全文 / 收起」热区相对字形外扩的水平边距。
+    ///
+    /// 与 `ZHHTextLabel` 内 `expandHitControl` 的 frame 共用，避免手势命中与控件区域不一致。
+    static let expandHitPaddingX: CGFloat = 12
+    /// 「全文 / 收起」热区相对字形外扩的垂直边距。
+    static let expandHitPaddingY: CGFloat = 10
+
+    /// 截断 token 外扩后的命中矩形。
+    ///
+    /// 多行 token 会返回多段；零宽段会过滤掉。供点测与 `expandHitUnion` 共用。
+    /// - Parameter range: 展示串上的 truncation 区间。
+    /// - Returns: UIKit 坐标下外扩后的矩形列表。
+    func expandHitRects(for range: NSRange) -> [CGRect] {
+        guard range.length > 0 else { return [] }
+        return rects(for: range).map {
+            $0.insetBy(dx: -Self.expandHitPaddingX, dy: -Self.expandHitPaddingY)
+        }.filter { $0.width > 0 && $0.height > 0 }
+    }
+
+    /// 截断 token 外扩热区的并集。
+    ///
+    /// Label 用单个 `UIControl` 承接命中时取并集即可；跨行 token 会略放大热区，但实现更简单。
+    /// - Parameter range: 展示串上的 truncation 区间。
+    /// - Returns: 外扩矩形的并集；没有有效矩形时为 nil。
+    func expandHitUnion(for range: NSRange) -> CGRect? {
+        let padded = expandHitRects(for: range)
+        guard let first = padded.first else { return nil }
+        // 多段时取并集，交给一个 UIControl 覆盖。
+        return padded.dropFirst().reduce(first) { $0.union($1) }
+    }
+
     /// 「全文 / 收起」用外扩矩形命中，手指稍偏也能点中。
+    ///
+    /// 热区几何与 `expandHitRects` / Label 的 `expandHitControl` 保持一致。
     func hitExpandToken(at point: CGPoint, displayText: NSAttributedString) -> ZHHTextHitAction? {
         guard displayText.length > 0 else { return nil }
         let full = NSRange(location: 0, length: displayText.length)
@@ -560,8 +593,7 @@ final class ZHHTextLineLayout {
         displayText.enumerateAttribute(ZHHTextAttribute.truncation, in: full) { value, range, stop in
             guard value != nil, range.length > 0 else { return }
             // 热区比字形大约一圈，列表里小字「全文」更好点。
-            let padded = rects(for: range).map { $0.insetBy(dx: -12, dy: -10) }
-            if padded.contains(where: { $0.contains(point) }) {
+            if expandHitRects(for: range).contains(where: { $0.contains(point) }) {
                 matched = ZHHTextHitAction(kind: .expand, displayRange: range)
                 stop.pointee = true
             }
