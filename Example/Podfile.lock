@@ -2,9 +2,9 @@ PODS:
   - LookinServer/Core (1.2.8)
   - LookinServer/Swift (1.2.8):
     - LookinServer/Core
-  - ZHHTextKit (1.0.3):
-    - ZHHTextKit/Source (= 1.0.3)
-  - ZHHTextKit/Source (1.0.3)
+  - ZHHTextKit (1.0.4):
+    - ZHHTextKit/Source (= 1.0.4)
+  - ZHHTextKit/Source (1.0.4)
 
 DEPENDENCIES:
   - LookinServer/Swift

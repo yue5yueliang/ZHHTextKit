@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'ZHHTextKit'
-  s.version          = '1.0.3'
+  s.version          = '1.0.4'
   s.summary          = '纯 Swift 富文本组件，供 Feed、评论、私信等场景复用。'
 
   s.description      = <<-DESC

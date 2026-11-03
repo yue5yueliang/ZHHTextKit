@@ -12,7 +12,7 @@ import UIKit
 ///
 /// 水平排版。后续若增加竖排，仍通过 `apply`、`text`、`onTapLink`、可选的 `onTapBody` 与 `onLongPress` 使用，不另开一套数据接口。
 /// 链接的 `range` 始终相对未截断全文。完全落在被裁掉区域里的链接不可点；与可见区有交集的链接保持可点，回调里的 range 仍是原文区间。
-/// 「全文 / 收起」热区由内部透明 `UIControl` 承接命中，便于宿主按 `UIControl` 排除单击暂停等手势；话题等链接仍由 Label 自身处理。
+/// 「全文 / 收起」热区由内部透明 `UIButton` 承接命中，并在按下时暂时冻结祖先单击手势，避免短视频滑滑流误触暂停；话题等链接仍由 Label 自身处理。
 ///
 /// 列表复用时把展开态放在数据模型上，并为可见区域附近的数据调用 `ZHHTextLayoutPrefetcher`。
 /// `layoutCache` 命中后不会把上一条内容画到当前 cell。
@@ -66,18 +66,21 @@ open class ZHHTextLabel: UIView {
         gesture.isEnabled = false
         return gesture
     }()
-    /// 承接「全文 / 收起」热区的透明控件。
+    /// 承接「全文 / 收起」热区的透明按钮。
     ///
-    /// 视觉仍是内联 token，不额外画按钮；点击时 `touch.view` 落在 `UIControl` 上，
-    /// 便于短视频滑滑流等宿主按「跳过 UIControl」排除单击暂停手势。
+    /// 视觉仍是内联 token，不额外画按钮。使用 `UIButton`（而非裸 `UIControl`）是因为
+    /// 短视频滑滑流等宿主对 `UIButton` 的命中更稳；按下时还会暂时关掉祖先链上的单击手势，
+    /// 避免与播放器单击暂停抢同一触摸。
     /// 仅在存在可点截断 token 时启用；无 token 时隐藏，避免挡底层手势。
-    private lazy var expandHitControl: UIControl = {
-        let control = UIControl()
+    private lazy var expandHitControl: UIButton = {
+        let control = UIButton(type: .custom)
         // 透明覆盖，不改变内联 token 的绘制外观。
         control.backgroundColor = .clear
         // 默认关闭；等排版算出 truncationRange 后再打开。
         control.isHidden = true
         control.isUserInteractionEnabled = false
+        // 独占本轮触摸，减少与祖先单击手势同时识别。
+        control.isExclusiveTouch = true
         // 无障碍继续走 Label 自身的 staticText，避免重复朗读。
         control.isAccessibilityElement = false
         control.addTarget(self, action: #selector(handleExpandControlTouchDown), for: .touchDown)
@@ -93,6 +96,10 @@ open class ZHHTextLabel: UIView {
     ///
     /// 与 `layout.truncationRange` 对齐，供 control 按下时画高亮；无可点 token 时为 nil。
     private var expandTokenDisplayRange: NSRange?
+    /// 按下展开热区时被暂时禁用的祖先单击手势，抬起/取消后按原状态恢复。
+    private var frozenAncestorTapGestures: [(UITapGestureRecognizer, Bool)] = []
+    /// 延后恢复祖先单击手势的任务，避免与同一次 touch 抬起抢识别。
+    private var unfreezeAncestorTapWorkItem: DispatchWorkItem?
 
     // MARK: - 公开属性
 
@@ -273,6 +280,7 @@ open class ZHHTextLabel: UIView {
 
     /// 当前宽度下正文是否超出 `numberOfLines`。还没有宽度时为 false。
     public var isTruncated: Bool {
+        // 与 sizeThatFits 同源宽度；尚无宽度时无法判断截断。
         let width = measurementWidth(fitting: 0)
         guard width > 0 else { return false }
         return layout(constrainedWidth: width).isTruncated
@@ -297,6 +305,7 @@ open class ZHHTextLabel: UIView {
     /// 同时替换全文和链接。适合直接承接 `ZHHTextParser` 的输出，也适合业务自行染色后的结果。
     /// - Parameter result: 解析结果；`links` 的 range 需与 `attributedText` 对齐。
     public func apply(_ result: ZHHTextParseResult) {
+        // 一次性写入正文与链接，标记为 applied，后续改 style 不再重新解析。
         storedText = result.attributedText.string
         storedAttributedText = result.attributedText
         storedLinks = result.links
@@ -309,6 +318,7 @@ open class ZHHTextLabel: UIView {
     /// - Returns: 命中的链接；点在空白或截断 token 上时为 nil。
     public func link(at point: CGPoint) -> ZHHTextLink? {
         guard let action = hitAction(at: point) else { return nil }
+        // 只暴露正文链接；.expand / .body 对调用方视为未命中链接。
         if case .link(let link) = action.kind {
             return link
         }
@@ -318,6 +328,7 @@ open class ZHHTextLabel: UIView {
     /// 在指定点执行一次点击（单测用）。
     /// - Parameter point: 相对 bounds 的点。
     func performInteraction(at point: CGPoint) {
+        // 绕过真实触摸链路，直接按命中结果分发，便于单元测试。
         guard let action = hitAction(at: point) else { return }
         activate(action)
     }
@@ -326,6 +337,7 @@ open class ZHHTextLabel: UIView {
     /// - Parameter point: 相对 bounds 的点。
     func performLongPress(at point: CGPoint) {
         guard allowsLongPressCopy else { return }
+        // 与手势 began 一致：先清短按高亮，再回调上下文。
         clearHighlight()
         onLongPress?(makeLongPressInfo(at: point))
     }
@@ -333,12 +345,14 @@ open class ZHHTextLabel: UIView {
     // MARK: - 布局与绘制
 
     open override func sizeThatFits(_ size: CGSize) -> CGSize {
+        // 用测算宽度排版后返回占用尺寸，供 Auto Layout / 手工测高。
         let width = measurementWidth(fitting: size.width)
         guard width > 0 else { return .zero }
         return layout(constrainedWidth: width).size
     }
 
     open override var intrinsicContentSize: CGSize {
+        // 宽度交给外部约束；这里只给出按 preferredMaxLayoutWidth / bounds 算出的高度。
         let width = measurementWidth(fitting: 0)
         guard width > 0, width.isFinite else {
             return CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
@@ -356,11 +370,13 @@ open class ZHHTextLabel: UIView {
         }
         if bounds.width != lastBoundsWidth {
             lastBoundsWidth = bounds.width
+            // 宽度变了，本地排版缓存失效，下一次 layout() 会重算。
             if cachedLayoutWidth != bounds.width {
                 cachedLayout = nil
                 cachedLayoutWidth = nil
             }
             setNeedsDisplay()
+            // 未设 preferredMaxLayoutWidth 时，高度随 bounds 宽度变化。
             if preferredMaxLayoutWidth <= 0 {
                 invalidateIntrinsicContentSize()
             }
@@ -375,6 +391,7 @@ open class ZHHTextLabel: UIView {
         super.draw(rect)
         guard bounds.width > 0, bounds.height > 0, let context = UIGraphicsGetCurrentContext() else { return }
         let result = layout(constrainedWidth: bounds.width)
+        // 正文按压用前景字色；链接 / 展开 token 用背景高亮。
         let highlightStyle: ZHHTextLineLayout.PressHighlightStyle = highlightUsesForeground ? .foreground : .background
         let color: UIColor
         if highlightUsesForeground {
@@ -397,6 +414,7 @@ open class ZHHTextLabel: UIView {
 
     open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
+        // 深浅色切换后动态色需重新解析进 displayText。
         if traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
             publishContentChange()
         }
@@ -408,7 +426,7 @@ open class ZHHTextLabel: UIView {
         guard isUserInteractionEnabled, !isHidden, alpha > 0.01 else { return nil }
         guard self.point(inside: point, with: event) else { return nil }
 
-        // 展开热区优先落到 UIControl：宿主 `shouldReceive` 可用 `touch.view is UIControl` 跳过暂停。
+        // 展开热区优先落到 UIButton：宿主可用 UIControl/UIButton 排除手势；库内另会冻结祖先单击。
         if expandHitControl.isUserInteractionEnabled, !expandHitControl.isHidden {
             let local = convert(point, to: expandHitControl)
             if expandHitControl.point(inside: local, with: event) {
@@ -436,15 +454,18 @@ open class ZHHTextLabel: UIView {
         return nil
     }
 
+    /// 长按手势回调。仅在 began 时触发一次；cancelsTouchesInView 会取消本次短按。
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard allowsLongPressCopy, gesture.state == .began else { return }
         let point = gesture.location(in: self)
+        // 清掉短按高亮，避免长按菜单弹出后仍留着按下态。
         clearHighlight()
         onLongPress?(makeLongPressInfo(at: point))
     }
 
-    /// 展开热区按下：用截断 token 区间画背景高亮，与原先 Label 触摸路径观感一致。
+    /// 展开热区按下：高亮 token，并暂时冻结祖先单击手势，避免播放器把这次点击当成暂停。
     @objc private func handleExpandControlTouchDown() {
+        freezeAncestorSingleTapGestures()
         guard let range = expandTokenDisplayRange else { return }
         activeHit = ZHHTextHitAction(kind: .expand, displayRange: range)
         highlightedRange = range
@@ -453,33 +474,84 @@ open class ZHHTextLabel: UIView {
         setNeedsDisplay()
     }
 
-    /// 展开热区抬起：清除高亮，并走与 `.expand` 相同的 `activate`（切换展开态 + `onTapExpand`）。
+    /// 展开热区抬起：清除高亮，切换展开态，并延后恢复祖先单击手势。
     @objc private func handleExpandControlTouchUpInside() {
         clearHighlight()
         activate(ZHHTextHitAction(
             kind: .expand,
             displayRange: expandTokenDisplayRange ?? NSRange(location: 0, length: 0)
         ))
+        // 同一次 touch 抬起阶段若立刻解冻，播放器单击手势仍可能识别成功；延后到下一拍。
+        scheduleUnfreezeAncestorSingleTapGestures()
     }
 
-    /// 展开热区取消或拖出：只清高亮，不切换展开态。
+    /// 展开热区取消或拖出：只清高亮并延后恢复祖先单击手势，不切换展开态。
     @objc private func handleExpandControlTouchCancel() {
         clearHighlight()
+        scheduleUnfreezeAncestorSingleTapGestures()
+    }
+
+    /// 暂时禁用祖先视图上的单击 `UITapGestureRecognizer`（含播放器单击暂停）。
+    ///
+    /// 短视频 SDK 常把单击手势挂在 cell / 播放器祖先上；仅靠控件命中无法可靠挡住。
+    /// 在 `touchDown` 时按原 `isEnabled` 记录后关掉，抬起或取消后再延后恢复。
+    private func freezeAncestorSingleTapGestures() {
+        // 取消尚未执行的恢复任务，并先还原上一次冻结，避免重复叠加记录。
+        unfreezeAncestorTapWorkItem?.cancel()
+        unfreezeAncestorTapWorkItem = nil
+        unfreezeAncestorSingleTapGestures()
+        // 从自身一路走到 window，覆盖 cell / 自定义覆盖层上的单击暂停手势。
+        var cursor: UIView? = self
+        while let view = cursor {
+            for gesture in view.gestureRecognizers ?? [] {
+                // 只动单击；双击等其它手势保持原样。
+                guard let tap = gesture as? UITapGestureRecognizer, tap.numberOfTapsRequired == 1 else { continue }
+                frozenAncestorTapGestures.append((tap, tap.isEnabled))
+                tap.isEnabled = false
+            }
+            cursor = view.superview
+        }
+    }
+
+    /// 下一拍再恢复祖先单击手势，避开同一次 touch 抬起的识别窗口。
+    private func scheduleUnfreezeAncestorSingleTapGestures() {
+        unfreezeAncestorTapWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.unfreezeAncestorSingleTapGestures()
+        }
+        unfreezeAncestorTapWorkItem = work
+        // 放到下一 runloop，让当前 touch 的手势识别先结束。
+        DispatchQueue.main.async(execute: work)
+    }
+
+    /// 按冻结时记录的 `isEnabled` 恢复祖先单击手势。
+    private func unfreezeAncestorSingleTapGestures() {
+        unfreezeAncestorTapWorkItem?.cancel()
+        unfreezeAncestorTapWorkItem = nil
+        guard !frozenAncestorTapGestures.isEmpty else { return }
+        // 按冻结前的开关状态还原，避免把业务原本禁用的手势误打开。
+        for (tap, wasEnabled) in frozenAncestorTapGestures {
+            tap.isEnabled = wasEnabled
+        }
+        frozenAncestorTapGestures.removeAll(keepingCapacity: false)
     }
 
     open override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // 展开热区由 expandHitControl 接手，不会进到这里。
         guard let point = touches.first?.location(in: self), let action = hitAction(at: point) else {
             clearHighlight()
             return
         }
         activeHit = action
         highlightedRange = action.displayRange
+        // 正文用前景字色高亮；链接等用背景底。
         highlightUsesForeground = (action.kind == .body)
         setNeedsDisplay()
     }
 
     open override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let point = touches.first?.location(in: self) else { return }
+        // 滑出同类命中区域则取消高亮，松手时也不会 activate。
         guard let action = hitAction(at: point), action.kind == activeHit?.kind else {
             highlightedRange = nil
             highlightUsesForeground = false
@@ -495,11 +567,13 @@ open class ZHHTextLabel: UIView {
         let hit = activeHit
         defer { clearHighlight() }
         guard let hit = hit, let point = touches.first?.location(in: self) else { return }
+        // 抬起点仍落在同类命中上才分发，避免拖出后误触发。
         guard let action = hitAction(at: point), action.kind == hit.kind else { return }
         activate(action)
     }
 
     open override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // 系统取消（含长按 cancelsTouchesInView）时只清高亮，不分发点击。
         clearHighlight()
     }
 }
@@ -510,13 +584,16 @@ private extension ZHHTextLabel {
 
     /// 公共初始化：透明背景、重绘、可点、无障碍。
     func commonInit() {
+        // 透明底，交给 CoreText 自己画字，避免系统默认不透明底挡住列表背景。
         backgroundColor = .clear
         isOpaque = false
         clipsToBounds = true
         isUserInteractionEnabled = true
+        // bounds 或内容变化时走 draw(_:)，而不是拉伸缓存图层。
         contentMode = .redraw
         isAccessibilityElement = true
         accessibilityTraits = .staticText
+        // 多行文本高度优先保真，避免被压缩成单行。
         setContentCompressionResistancePriority(.required, for: .vertical)
         setContentHuggingPriority(.required, for: .vertical)
         // 先挂上热区控件；默认隐藏，等有 truncationRange 再启用。
@@ -534,9 +611,11 @@ private extension ZHHTextLabel {
     ///   - newValue: 纯文本；为 nil 时清空。
     ///   - force: 为 true 时即使文本相同也重新解析。
     func setPlainText(_ newValue: String?, force: Bool) {
+        // 非强制且文案未变时跳过，避免重复解析和无效重排。
         if !force && newValue == storedText { return }
         storedText = newValue
         guard let newValue = newValue else {
+            // 清空正文：富文本与链接一并丢掉；来源仍按有无 parser 区分。
             storedAttributedText = nil
             storedLinks = []
             contentSource = parser == nil ? .plain : .parsed
@@ -544,26 +623,28 @@ private extension ZHHTextLabel {
             return
         }
         if let parser = parser {
+            // 走解析器：得到染色后的 attributedText 与可点 links。
             let result = parser.parse(newValue)
             storedAttributedText = result.attributedText
             storedLinks = result.links
             contentSource = .parsed
         } else {
-            storedAttributedText = NSAttributedString(
-                string: newValue,
-                attributes: style.attributes(for: .body)
-            )
+            // 无解析器：按当前 style 的正文属性直接生成纯富文本，不带链接。
+            storedAttributedText = NSAttributedString(string: newValue, attributes: style.attributes(for: .body))
             storedLinks = []
             contentSource = .plain
         }
+        // 清空布局缓存并请求重绘 / 重测 intrinsic size。
         publishContentChange()
     }
 
     /// 正文或截断配置变化后清空缓存并请求重排。
     func publishContentChange() {
+        // 抬高代数，丢弃可能晚到的异步排版结果。
         layoutGeneration += 1
         cachedLayout = nil
         cachedLayoutWidth = nil
+        // 按下态与旧内容脱钩，避免高亮画在新文案上。
         highlightedRange = nil
         highlightUsesForeground = false
         activeHit = nil
@@ -585,12 +666,15 @@ private extension ZHHTextLabel {
     /// - Parameter proposedWidth: `sizeThatFits` 传入的宽度；无效时忽略。
     /// - Returns: 可用宽度；尚无宽度时为 0。
     func measurementWidth(fitting proposedWidth: CGFloat) -> CGFloat {
+        // sizeThatFits 传入的有效宽度优先。
         if proposedWidth > 0, proposedWidth.isFinite {
             return proposedWidth
         }
+        // Auto Layout 测高常用 preferredMaxLayoutWidth。
         if preferredMaxLayoutWidth > 0 {
             return preferredMaxLayoutWidth
         }
+        // 已布局时退到当前 bounds。
         if bounds.width > 0 {
             return bounds.width
         }
@@ -601,6 +685,7 @@ private extension ZHHTextLabel {
     /// - Parameter width: 排版宽度。
     /// - Returns: 排版结果。
     func layout(constrainedWidth width: CGFloat) -> ZHHTextLayout {
+        // 同宽度本地命中，避免 draw / hitTest / sizeThatFits 重复排版。
         if let cachedLayout = cachedLayout, cachedLayoutWidth == width {
             return cachedLayout
         }
@@ -611,6 +696,7 @@ private extension ZHHTextLabel {
             cache: layoutCache,
             asynchronous: displaysAsynchronously
         )
+        // 等待期间内容又变了：丢掉这次结果，按新代数重算。
         if generation != layoutGeneration {
             return layout(constrainedWidth: width)
         }
@@ -623,6 +709,7 @@ private extension ZHHTextLabel {
     /// - Parameter width: 排版宽度。
     /// - Returns: 引擎输入。
     func makeRequest(_ width: CGFloat) -> ZHHTextLayoutRequest {
+        // 快照当前截断配置与界面风格，供引擎 / 共享缓存使用。
         ZHHTextLayoutRequest(
             attributedText: storedAttributedText ?? NSAttributedString(),
             links: storedLinks,
@@ -652,6 +739,7 @@ private extension ZHHTextLabel {
         case .link(let link):
             onTapLink?(link)
         case .expand:
+            // 先改状态触发重排，再把切换后的 isExpanded 回调给业务。
             isExpanded = !isExpanded
             onTapExpand?(isExpanded)
         case .body:
@@ -694,19 +782,25 @@ private extension ZHHTextLabel {
     }
 
     /// 按排版结果摆放行内视图和图层，并移除过期的宿主。
+    ///
+    /// 同一轮遍历里分别处理 `ZHHTextViewAttachment` 与 `ZHHTextLayerAttachment`；
+    /// 用 `live` / `liveLayers` 记录本轮仍出现的身份，最后清掉正文里已不存在的旧附件。
     /// - Parameter layout: 当前宽度下的排版。
     func placeViewAttachments(_ layout: ZHHTextLayout) {
         let text = layout.displayText
+        // 本轮仍存活的视图 / 图层身份；结束后用来对比并卸载过期附件。
         var live = Set<ObjectIdentifier>()
         var liveLayers = Set<ObjectIdentifier>()
         let full = NSRange(location: 0, length: text.length)
         if full.length > 0 {
+            // 行内 UIView 附件：挂到 Label 上，按字形框居中摆放。
             text.enumerateAttribute(ZHHTextAttachmentAttribute.key, in: full, options: []) { value, range, _ in
                 guard let attachment = value as? ZHHTextViewAttachment else { return }
                 let view = attachment.view
                 let identifier = ObjectIdentifier(view)
                 live.insert(identifier)
                 self.attachmentHosts[identifier] = view
+                // 被截断或尚未算出矩形时先隐藏，避免残留在错误位置。
                 guard let rect = layout.lineLayout.rects(for: range).first, rect.width > 0 else {
                     view.isHidden = true
                     return
@@ -716,13 +810,10 @@ private extension ZHHTextLabel {
                 }
                 view.isHidden = false
                 let size = attachment.layoutSize
-                view.frame = CGRect(
-                    x: rect.minX + (rect.width - size.width) / 2,
-                    y: rect.minY + (rect.height - size.height) / 2,
-                    width: size.width,
-                    height: size.height
-                )
+                // 在 run 矩形内居中；layoutSize 可能小于占位框。
+                view.frame = CGRect(x: rect.minX + (rect.width - size.width) / 2, y: rect.minY + (rect.height - size.height) / 2, width: size.width, height: size.height)
             }
+            // 行内 CALayer 附件：挂到 Label.layer，几何规则与视图附件相同。
             text.enumerateAttribute(ZHHTextAttachmentAttribute.key, in: full, options: []) { value, range, _ in
                 guard let attachment = value as? ZHHTextLayerAttachment else { return }
                 let layer = attachment.layer
@@ -738,14 +829,11 @@ private extension ZHHTextLabel {
                 }
                 layer.isHidden = false
                 let size = attachment.layoutSize
-                layer.frame = CGRect(
-                    x: rect.minX + (rect.width - size.width) / 2,
-                    y: rect.minY + (rect.height - size.height) / 2,
-                    width: size.width,
-                    height: size.height
-                )
+                // 与视图附件相同：在 run 矩形内居中。
+                layer.frame = CGRect(x: rect.minX + (rect.width - size.width) / 2, y: rect.minY + (rect.height - size.height) / 2, width: size.width, height: size.height)
             }
         }
+        // 卸掉本轮正文里不再出现的视图宿主（复用 / 改文案后避免串内容）。
         let stale = attachmentHosts.keys.filter { live.contains($0) == false }
         for identifier in stale {
             if let view = attachmentHosts[identifier], view.superview === self {
@@ -753,6 +841,7 @@ private extension ZHHTextLabel {
             }
             attachmentHosts.removeValue(forKey: identifier)
         }
+        // 同样清理过期图层附件。
         let staleLayers = attachmentLayers.keys.filter { liveLayers.contains($0) == false }
         for identifier in staleLayers {
             if let layer = attachmentLayers[identifier], layer.superlayer === self.layer {
@@ -766,6 +855,7 @@ private extension ZHHTextLabel {
     /// - Parameter point: 相对 bounds 的点。
     /// - Returns: 命中动作；点在空白处为 nil。
     func hitAction(at point: CGPoint) -> ZHHTextHitAction? {
+        // 短按路径沿用对外开关；长按组装上下文时会显式传入 true。
         hitAction(at: point, allowsBodyTap: allowsBodyTap)
     }
 
@@ -776,8 +866,10 @@ private extension ZHHTextLabel {
     /// - Returns: 命中动作；点在空白处为 nil。
     func hitAction(at point: CGPoint, allowsBodyTap: Bool) -> ZHHTextHitAction? {
         let width = bounds.width > 0 ? bounds.width : preferredMaxLayoutWidth
+        // 尚无宽度时无法排版，直接视为未命中。
         guard width > 0 else { return nil }
         let result = layout(constrainedWidth: width)
+        // 具体优先级由 lineLayout.hit 实现：截断 token > 边框链接 > 字形 > 外扩。
         return result.lineLayout.hit(
             at: point,
             displayText: result.displayText,
@@ -787,39 +879,44 @@ private extension ZHHTextLabel {
     }
 
     /// 组装长按回调上下文。分类时强制探测正文，不依赖 `allowsBodyTap`。
+    /// - Parameter point: 相对 bounds 的点。
+    /// - Returns: 供业务自行组装菜单或复制的上下文。
     func makeLongPressInfo(at point: CGPoint) -> ZHHTextLongPressInfo {
+        // 优先用当前 bounds 宽度排版；尚未布局时退到 preferredMaxLayoutWidth。
         let width = bounds.width > 0 ? bounds.width : preferredMaxLayoutWidth
         let result = width > 0 ? layout(constrainedWidth: width) : nil
+
+        // 原文富文本与纯文本：库不写剪贴板，把完整内容交给业务。
         let attributed = storedAttributedText ?? NSAttributedString()
         let plain = storedText ?? attributed.string
+        // 当前可见串（含截断 token）；尚无排版时退回全文。
         let visible = result?.displayText.string ?? plain
 
+        // 强制允许正文命中，避免业务未开 allowsBodyTap 时长按只能得到 empty。
+        // 优先级仍与短按一致：截断 token > 链接 > 正文。
         let action = hitAction(at: point, allowsBodyTap: true)
         let kind: ZHHTextLongPressInfo.Kind
         let displayRange: NSRange?
         switch action?.kind {
         case .link(let link):
+            // 命中话题 / 提及 / URL 等；displayRange 相对展示串，供高亮或菜单定位。
             kind = .link(link)
             displayRange = action?.displayRange
         case .expand:
+            // 命中「全文 / 收起」或自定义 truncationToken。
             kind = .expand
             displayRange = action?.displayRange
         case .body:
+            // 命中普通正文字形（含正文热区外扩）。
             kind = .body
             displayRange = action?.displayRange
         case .none:
+            // 点在空白或尚未有排版宽度时，不附带区间。
             kind = .empty
             displayRange = nil
         }
 
-        return ZHHTextLongPressInfo(
-            point: point,
-            kind: kind,
-            plainText: plain,
-            visibleText: visible,
-            attributedText: attributed,
-            displayRange: displayRange
-        )
+        return ZHHTextLongPressInfo(point: point, kind: kind, plainText: plain, visibleText: visible, attributedText: attributed, displayRange: displayRange)
     }
 
     /// 清除按下高亮和当前命中。
@@ -827,6 +924,7 @@ private extension ZHHTextLabel {
         activeHit = nil
         highlightedRange = nil
         highlightUsesForeground = false
+        // 去掉高亮区间后重绘，恢复未按下外观。
         setNeedsDisplay()
     }
 }
